@@ -271,11 +271,9 @@ def load_scotus_graph(cur, data: dict):
         ))
 
 
-def check_already_seeded(cur) -> bool:
-    """Check if data has already been loaded."""
-    cur.execute("SELECT COUNT(*) FROM documents;")
-    count = cur.fetchone()[0]
-    return count > 0
+def _dataset_seeded(cur, dataset: str) -> bool:
+    cur.execute("SELECT COUNT(*) FROM documents WHERE dataset = %s;", (dataset,))
+    return cur.fetchone()[0] > 0
 
 
 def main():
@@ -287,34 +285,37 @@ def main():
         cur.execute("SET search_path = ag_catalog, public;")
         cur.execute("LOAD 'age';")
 
-        if check_already_seeded(cur):
-            print("Database already seeded. Skipping.")
-            conn.close()
-            return
+        embedding_provider = None
 
-        print("Generating org data...")
-        data = generate_all()
+        if not _dataset_seeded(cur, "acme"):
+            print("Generating Acme org data...")
+            data = generate_all()
+            load_graph(cur, data)
+            print(f"Acme graph loaded: {len(data['people'])} people, "
+                  f"{len(data['teams'])} teams, {len(data['projects'])} projects, "
+                  f"{len(data['services'])} services, {len(data['technologies'])} technologies")
+            embedding_provider = get_embedding_provider(settings.embedding_provider)
+            load_documents(cur, data, embedding_provider)
+            print(f"Acme documents loaded: {len(data['documents'])} documents with embeddings")
+        else:
+            print("Acme already seeded. Skipping.")
 
-        load_graph(cur, data)
-        print(f"Graph loaded: {len(data['people'])} people, "
-              f"{len(data['teams'])} teams, {len(data['projects'])} projects, "
-              f"{len(data['services'])} services, {len(data['technologies'])} technologies")
-
-        embedding_provider = get_embedding_provider(settings.embedding_provider)
-        load_documents(cur, data, embedding_provider)
-        print(f"Acme documents loaded: {len(data['documents'])} documents with embeddings")
-
-        print("Generating SCOTUS data...")
-        scotus_data = generate_scotus_all()
-        load_scotus_graph(cur, scotus_data)
-        print(
-            f"SCOTUS graph loaded: {len(scotus_data['cases'])} cases, "
-            f"{len(scotus_data['justices'])} justices, "
-            f"{len(scotus_data['issues'])} issues, "
-            f"{len(scotus_data['citations'])} citations"
-        )
-        load_documents(cur, scotus_data, embedding_provider)
-        print(f"SCOTUS documents loaded: {len(scotus_data['documents'])} documents with embeddings")
+        if not _dataset_seeded(cur, "scotus"):
+            print("Parsing SCOTUS case files...")
+            scotus_data = generate_scotus_all()
+            load_scotus_graph(cur, scotus_data)
+            print(
+                f"SCOTUS graph loaded: {len(scotus_data['cases'])} cases, "
+                f"{len(scotus_data['justices'])} justices, "
+                f"{len(scotus_data['issues'])} issues, "
+                f"{len(scotus_data['citations'])} citations"
+            )
+            if embedding_provider is None:
+                embedding_provider = get_embedding_provider(settings.embedding_provider)
+            load_documents(cur, scotus_data, embedding_provider)
+            print(f"SCOTUS documents loaded: {len(scotus_data['documents'])} documents with embeddings")
+        else:
+            print("SCOTUS already seeded. Skipping.")
 
     conn.close()
     print("Seed complete!")

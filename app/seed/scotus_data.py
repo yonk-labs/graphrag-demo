@@ -7,10 +7,12 @@ import os
 import re
 from pathlib import Path
 
-SCOTUS_SOURCE_DIR = os.environ.get(
-    "SCOTUS_SOURCE_DIR",
-    "/home/yonk/yonk-tools/pg-raggraph/benchmarks/scotus/"
+_DEFAULT_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "scotus",
 )
+SCOTUS_SOURCE_DIR = os.environ.get("SCOTUS_SOURCE_DIR", _DEFAULT_DATA_DIR)
 
 # --- Issue taxonomy (hand-curated keyword-based classification) ---
 ISSUE_KEYWORDS = {

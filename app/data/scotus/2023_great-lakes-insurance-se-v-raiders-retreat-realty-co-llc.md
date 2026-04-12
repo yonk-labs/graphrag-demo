@@ -1,0 +1,49 @@
+# Great Lakes Insurance SE v. Raiders Retreat Realty Co., LLC
+
+**Docket Number:** 22-500
+**Citation:** 601 U.S. ___ (2024)
+**Term:** 2023
+**Petitioner:** Great Lakes Insurance SE
+**Respondent:** Raiders Retreat Realty Co., LLC
+
+## Question Presented
+
+Is a choice-of-law clause in a maritime contract unenforceable if enforcement would conflict with the “strong public policy” of the state whose law is displaced?
+
+## Summary
+
+A case in which the Court held that under federal admiralty law, choice-of-law provisions in maritime contracts are presumptively enforceable under federal maritime law, with narrow exceptions not applicable in this case.
+
+## Facts of the Case
+
+Raiders Retreat Realty Co., a Pennsylvania company, insured a yacht for up to $550,000 with Great Lakes Insurance (GLI), a company headquartered in the United Kingdom. In June 2019, the yacht ran aground, incurring at least $300,000 in damage. Raiders submitted a claim to GLI for loss of the vessel, but GLI rejected it, claiming that, although none of the damage was due to fire, the entire policy was void because Raider had failed to timely recertify or inspect the yacht's fire-extinguishing equipment.
+GLI asked the district court for a declaratory judgment that Raiders’ omission voided the policy, and Raiders raised five counterclaims based on Pennsylvania law. The district court dismissed those counterclaims, finding that ​​the policy’s choice-of-law provision required the application of New York law. The court also rejected Raiders’ argument that the choice-of-law provision was unenforceable under the Supreme Court’s decision in The Bremen v. Zapata Off-Shore Co., 407 U.S. 1 (1972), which held that under federal admiralty law, a forum-selection provision is unenforceable “if enforcement would contravene a strong public policy of the forum in which suit is brought.” The U.S. Court of Appeals for the Third Circuit vacated, finding The Bremen controlled the outcome in this case.
+
+## Decision
+
+Choice-of-law provisions in maritime contracts are presumptively enforceable under federal maritime law, with narrow exceptions not applicable in this case. Justice Brett Kavanaugh authored the unanimous opinion of the Court.
+The Constitution confers federal jurisdiction over all maritime cases to ensure uniformity across the United States, with federal courts deriving maritime law from various sources such as judicial opinions and scholarly writings. In the absence of established maritime rules, federal courts possess the authority to formulate new, uniform maritime rules. Relevant to this discussion, federal maritime law presumes the validity of choice-of-law provisions in maritime contracts. The precedent set by the Wilburn Boat case, which permitted state law to address the absence of uniform federal maritime rules, does not extend to choice-of-law provisions. Therefore, contrary to Raiders’ argument, state law does not serve to fill any gaps in this context, reinforcing the federal rule's presumption of enforceability for choice-of-law clauses in maritime contracts.
+Justice Clarence Thomas authored a concurring opinion to argue that the Wilburn Boat precedent rests on flawed premises and is at odds with the fundamental precept of admiralty law.
+
+## Vote Breakdown
+
+- Majority: 9 | Minority: 0 | Winning party: Great Lakes Insurance
+
+### Justices
+- **Brett M. Kavanaugh** — voted majority (majority)
+- **John G. Roberts, Jr.** — voted majority
+- **Clarence Thomas** — voted majority (concurrence)
+- **Samuel A. Alito, Jr.** — voted majority
+- **Sonia Sotomayor** — voted majority
+- **Elena Kagan** — voted majority
+- **Neil Gorsuch** — voted majority
+- **Amy Coney Barrett** — voted majority
+- **Ketanji Brown Jackson** — voted majority
+
+## Written Opinions
+
+### concurring by Unknown
+
+### majority by Unknown
+
+### syllabus by Unknown

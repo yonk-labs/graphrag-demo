@@ -134,7 +134,7 @@ def _traverse_from_entity(cur, label: str, entity_id: str, max_hops: int = 2) ->
 
 
 def _fetch_docs_for_entities(cur, entity_ids: list[str]) -> list[tuple]:
-    """Fetch documents authored by or related to the given entity IDs."""
+    """Fetch documents authored by or related to the given entity IDs, newest first."""
     if not entity_ids:
         return []
 
@@ -142,7 +142,8 @@ def _fetch_docs_for_entities(cur, entity_ids: list[str]) -> list[tuple]:
     cur.execute(
         f"SELECT title, content, doc_type, author_id, project_id "
         f"FROM documents "
-        f"WHERE author_id IN ({placeholders}) OR project_id IN ({placeholders})",
+        f"WHERE author_id IN ({placeholders}) OR project_id IN ({placeholders}) "
+        f"ORDER BY created_at DESC",
         entity_ids + entity_ids,
     )
     return cur.fetchall()

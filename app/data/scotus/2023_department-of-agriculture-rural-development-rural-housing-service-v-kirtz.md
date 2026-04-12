@@ -1,0 +1,46 @@
+# Department of Agriculture Rural Development Rural Housing Service v. Kirtz
+
+**Docket Number:** 22-846
+**Citation:** 601 U.S. ___ (2024)
+**Term:** 2023
+**Petitioner:** Department of Agriculture Rural Development Rural Housing Service
+**Respondent:** Reginald Kirtz
+
+## Question Presented
+
+Do the civil-liability provisions of the Fair Credit Reporting Act unequivocally and unambiguously waive the sovereign immunity of the United States?
+
+## Summary
+
+A case in which the Court held that the civil-liability provisions of the Fair Credit Reporting Act unequivocally and unambiguously waive the sovereign immunity of the United States.
+
+## Facts of the Case
+
+In 1970, Congress enacted the Fair Credit Reporting Act (FCRA) to regulate credit reporting and protect consumer privacy. The Act was amended in 1996 to impose additional obligations on entities like creditors and lenders that furnish information to credit reporting agencies. These amendments allowed consumers to dispute inaccuracies in their credit files and mandated furnishers to investigate and correct such inaccuracies. Reginald Kirtz filed a lawsuit in 2020 against Trans Union, AES, and the USDA, alleging both negligent and willful violations of the FCRA. Kirtz claimed that despite his loans being closed with a zero balance, both AES and the USDA continued to report him as “120 Days Past Due,” damaging his credit score. While Trans Union and AES responded to the lawsuit, the USDA sought dismissal, citing sovereign immunity. The district court granted the USDA’s motion, reasoning that the FCRA did not clearly express Congress’s intent to waive sovereign immunity, despite the Act’s language stating that it applies to “any person,” including government agencies. The U.S. Court of Appeals for the Third Circuit reversed, concluding that when Congress has clearly expressed its intent, as through the FCRA, even when the meaning is implausible, courts may neither second-guess its choices nor decline to apply the law as written.
+
+## Decision
+
+The civil-liability provisions of the Fair Credit Reporting Act (FCRA) waive the sovereign immunity of the United States. Justice Neil Gorsuch authored the unanimous opinion of the Court.
+As a sovereign entity, the United States is generally immune from suits seeking money damages—under the doctrine known as “sovereign immunity”—unless Congress chooses to waive that immunity. Courts understand Congress to have so chosen only if they find “the language of the statute” is “unmistakably clear” in allowing such suits. One way a statute may have such “unmistakably clear” language is when it creates a cause of action and explicitly “authorizes suit against a government on that claim.” The FCRA satisfies this stringent test.
+The FCRA’s requirements apply to “person[s]” who, like the federal government here, furnish information to consumer reporting agencies. Sections 1681n and 1681o create a cause of action for money damages to consumers injured by “any person” who willfully or negligently fails to comply with the statute’s directive. Section 1681a provides a definition of “person” that includes government agencies, which applies to the entire Act. In the presence of such “unmistakably clear” language, no separate waiver provision is needed.
+
+## Vote Breakdown
+
+- Majority: 9 | Minority: 0 | Winning party: Kirtz
+
+### Justices
+- **Neil Gorsuch** — voted majority (majority)
+- **John G. Roberts, Jr.** — voted majority
+- **Samuel A. Alito, Jr.** — voted majority
+- **Clarence Thomas** — voted majority
+- **Sonia Sotomayor** — voted majority
+- **Elena Kagan** — voted majority
+- **Brett M. Kavanaugh** — voted majority
+- **Amy Coney Barrett** — voted majority
+- **Ketanji Brown Jackson** — voted majority
+
+## Written Opinions
+
+### majority by Unknown
+
+### syllabus by Unknown
