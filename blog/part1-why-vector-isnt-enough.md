@@ -59,7 +59,11 @@ Stage 3: Graph Expand    (EXPENSIVE, CONDITIONAL, +30-60ms)
 Return
 ```
 
-Three things are doing work here. The first is that Stage 1 runs on every query and carries most of the load. Your fast path stays fast, roughly 30 milliseconds, because vector+BM25 is already fast and you haven't added anything heavy to it. The second is that Stage 2 turns graph into a signal instead of a competing retriever. You're not merging two separate ranked lists, you're nudging one ranked list using graph context. That 1.2x boost is small enough to never hurt a good answer and big enough to rescue a borderline one. The third is that Stage 3, the expensive path, only runs when it's likely to help. If the user asks a question with a clear graph shape, you spend the extra 30 to 60 milliseconds on a proper multi-hop Cypher query. If they ask "what is Chevron deference," you don't.
+Stage 1 carries most of the load, and it runs on every single query. Your fast path stays fast, roughly 30 milliseconds, because vector+BM25 was already fast and you haven't bolted anything heavy onto it. That's the foundation. Everything else is bonus.
+
+Stage 2 is the sneaky one. Instead of treating graph as a competing retriever with its own ranked list to merge in, you use it to nudge the vector ranking you already have. Grab the entities mentioned in the top-K chunks, look up their 1-hop neighbors, bump any chunk that mentions a neighbor by a 1.2x score multiplier. That's it. Small enough to never ruin a good answer, big enough to rescue a borderline one, and cheap enough (about 10ms) that you can leave it running on every query and forget about it.
+
+And then there's Stage 3, which mostly doesn't run. When the user asks a question with an obvious graph shape ("who voted with," "what depends on," "who owns"), or when your top-K vector scores all come back weak, you pay the extra 30 to 60 milliseconds to run a proper multi-hop Cypher query. When they ask "what is Chevron deference," you don't. That conditional is the whole point. Graph retrieval is expensive only when you make it expensive on every query.
 
 The win from this arrangement isn't raw peak accuracy. It's that graph stops being able to hurt you. Your worst case on a pure-semantic question is still vector+BM25, which was already 75% to 90% accurate. You never ship an answer that got worse because the ranker was confused. That's the floor nobody talks about.
 

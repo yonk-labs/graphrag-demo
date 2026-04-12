@@ -40,7 +40,7 @@ The bridge between graph and vector is the important part, and it's simpler than
 
 ## The four retrieval strategies
 
-Before I walk through the four strategies, I owe you a big honest caveat. Our demo runs all four strategies in parallel because we want to show you what each one retrieves in isolation, side by side, on the same question. That is NOT how you'd build this in production. In production, you'd use a 3-stage approach: vector+BM25 always, a cheap graph boost that re-ranks the vector results using 1-hop neighbors, and an expensive graph-expand step that only runs when the query shape or the vector confidence tells you it's worth it. I'll walk through the right production architecture after I show you the demo version, in a section called "What production should actually look like." If you only read one section of this post, skim the strategies and then read that one.
+Quick note before we get into it: the demo runs all four strategies in parallel on purpose, so you can see what each one retrieves in isolation on the same question. That's a teaching setup, not a production setup. We'll get to the production shape later in the post, once you've seen what the individual retrievers actually do.
 
 Four strategies, one demo. Each one is a separate Python class, each one gets called in parallel from the API, and each one returns a list of `RetrievedItem` objects that the UI renders side by side.
 
@@ -142,7 +142,7 @@ So what does that actually mean? It means intent detection in this demo is basic
 
 ## What production should actually look like
 
-Everything up to this point describes the demo. The demo is a teaching tool and I'm proud of it, but I'm not going to let you walk away thinking "parallel-merge four retrievers into one ranker" is the production pattern. It isn't. I ran the benchmark, and the benchmark told me otherwise, and I'd rather you get the honest version than the demo version.
+Okay. You've seen what each retriever does on its own and how the combined path stitches them together. Time to pay off the caveat from earlier. The parallel-merge pattern you just watched is a great teaching tool and a lousy production architecture, and the benchmark numbers are why. I'm not going to let you walk away thinking "dump four retrievers into a ranker" is the production answer, because I ran the comparison myself and it isn't.
 
 Here's the shape of the production architecture, the one you'd actually build if you were shipping this to paying users:
 
@@ -173,15 +173,13 @@ Return
 
 Three stages, and the interesting design decision is which stage runs on which query. Stage 1 runs on every query, always. Stage 2 runs on every query too, but it's cheap because it's just a 1-hop neighbor lookup for a handful of entities and a score re-weight. Stage 3 runs only when the query earns it.
 
-Why does this beat the parallel-merge approach I showed you in the demo? Three reasons.
+So why is this better than the parallel-merge thing you just watched the demo do? Start with the obvious one: the fast path actually stays fast. On a question like "what cases deal with administrative overreach," Stage 3 never fires at all, Stage 2 adds about 10ms of neighbor lookups, and your query completes in roughly 30 milliseconds total because vector+BM25 is carrying almost everything. You don't pay graph-expand latency on questions that gain nothing from graph-expand. Parallel-merge pays it every time.
 
-First, the fast path stays fast. On a question like "what cases deal with administrative overreach," Stage 3 never fires, and your query completes in roughly 30 milliseconds because vector+BM25 is carrying the whole load. You're not paying graph-expand latency on questions that don't benefit from graph expand.
+The second win is more subtle and it matters more. In parallel-merge, graph results get ranked against vector results and some merge function has to decide who wins. That's exactly where graph can hurt you on the wrong question, because a weak graph hit will push a strong vector hit off the page. The 3-stage arrangement never lets that happen, because graph isn't competing for a spot on the list. It's adjusting the scores of chunks that were already on the list. The ranker cannot get confused by a retriever it isn't talking to.
 
-Second, graph becomes a signal instead of a competing retriever. In the parallel-merge approach, graph results get ranked against vector results and the merge function has to decide which to trust. That's where graph hurts you on the wrong question, because a weak graph hit can push a strong vector hit off the page. In the 3-stage approach, graph never replaces a vector result. It just boosts vector results that are already in the running. The ranker never gets confused.
+And then Stage 3, when it runs, runs all the way. No fuzzing a multi-hop pattern match into a ranked list and praying RRF sorts it out. If your query earned Stage 3, you get proper Cypher, a structural answer, and that answer goes straight to the top of the result list because it actually answers the question, not because it happened to tie with a hybrid search.
 
-Third, Stage 3 gets the full Cypher treatment when it does run. No fuzzing the output into a ranked list and hoping RRF sorts it out. A multi-hop query that's earned Stage 3 runs proper Cypher, returns a structural answer, and that answer goes to the top of the result list because it's the answer, not because it tied with a hybrid search.
-
-The benchmark numbers I kept staring at: vector+BM25 alone hits 75% to 90% accuracy on the majority of our test questions. Graph, applied correctly as a boost, adds another 1% to 5% on the questions that need multi-hop reasoning. And graph, applied incorrectly as a parallel retriever on questions that don't need it, SUBTRACTS 2% to 4%, because the dilution effect is real. The 3-stage arrangement is how you get the +1 to +5 benefit without paying the -2 to -4 cost.
+The benchmark numbers from Part 1 are what sold me on this. Vector+BM25 alone landed somewhere between 75% and 90% accuracy on the bulk of the test set. Adding graph as a boost on the questions that need multi-hop reasoning moved the needle another few points, on the order of a single-digit bump. Slapping graph in as a parallel retriever on questions that didn't need it actually made things worse by a couple of points, thanks to dilution. The 3-stage architecture is how you collect the upside from the multi-hop questions without eating the downside everywhere else. Same numbers we saw in Part 1, different arrangement, very different result.
 
 Here's what Stage 2 looks like in pseudocode, just to make the shape concrete:
 
@@ -222,7 +220,7 @@ def stage3_graph_expand(query, cur):
     return run_multihop_cypher(query, cur)
 ```
 
-That's the production path. The demo doesn't run this because the demo is showing you what each retriever returns in isolation. Our "combined" strategy is intentionally more aggressive than a production pipeline should be. It's showing off capability, not optimizing for precision. If you copy the combined strategy verbatim into your product, you're going to see that -2 to -4% dilution effect on a chunk of your user questions, and you're going to wonder why your benchmark numbers got worse after you added graph. They got worse because you added graph to the ranker instead of adding graph to the re-rank step. Don't do that. Do 3-stage.
+That's the production path. The demo doesn't run this because the demo is showing you what each retriever returns in isolation. Our "combined" strategy is intentionally more aggressive than a production pipeline should be. It's showing off capability, not optimizing for precision. Copy the combined strategy verbatim into your product and you'll watch that dilution effect quietly eat a chunk of your questions, and then you'll wonder why your benchmark numbers got worse after you added graph. They got worse because you added graph to the ranker instead of to the re-rank step. Don't do that. Do 3-stage.
 
 ## The side-by-side demo UI
 
