@@ -1,0 +1,7 @@
+.env
+pgdata/
+__pycache__/
+.superpowers/
+skill-output/
+*.pyc
+.pytest_cache/
