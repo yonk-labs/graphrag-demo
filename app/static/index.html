@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GraphRAG Demo: AGE + pgvector</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>GraphRAG Demo</h1>
+        <p class="subtitle">Apache AGE + pgvector: Side-by-Side Retrieval Comparison</p>
+    </header>
+
+    <div class="search-section">
+        <div class="search-bar">
+            <input type="text" id="question-input" placeholder="Ask a question about the organization...">
+            <button id="search-btn" onclick="runQuery()">Search</button>
+        </div>
+        <div class="examples">
+            <span class="examples-label">Try:</span>
+            <div id="example-buttons"></div>
+        </div>
+    </div>
+
+    <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <p>Running all three retrieval strategies...</p>
+    </div>
+
+    <div id="results" class="results hidden">
+        <div class="strategy-column" id="col-vector">
+            <div class="strategy-header vector-header">
+                <h2>Vector-Only</h2>
+                <span class="strategy-desc">pgvector cosine similarity</span>
+            </div>
+            <div class="timing-bar" id="timing-vector"></div>
+            <div class="answer-box" id="answer-vector"></div>
+            <div class="results-list" id="results-vector"></div>
+        </div>
+
+        <div class="strategy-column" id="col-graph">
+            <div class="strategy-header graph-header">
+                <h2>Graph-Only</h2>
+                <span class="strategy-desc">Apache AGE Cypher traversal</span>
+            </div>
+            <div class="timing-bar" id="timing-graph"></div>
+            <div class="answer-box" id="answer-graph"></div>
+            <div class="results-list" id="results-graph"></div>
+        </div>
+
+        <div class="strategy-column" id="col-combined">
+            <div class="strategy-header combined-header">
+                <h2>Graph + Vector</h2>
+                <span class="strategy-desc">Vector seed, graph expand, re-rank</span>
+            </div>
+            <div class="timing-bar" id="timing-graph+vector"></div>
+            <div class="answer-box" id="answer-graph+vector"></div>
+            <div class="results-list" id="results-graph+vector"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
