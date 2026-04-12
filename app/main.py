@@ -91,10 +91,17 @@ def _run_strategy(name: str, question: str, top_k: int) -> dict:
     from timing import timed_stage
     context = [f"[{r.doc_type}] {r.title}\n{r.content}" for r in results[:5]]
     with timed_stage(timing, "llm_generation"):
-        if context:
-            answer = _llm_provider.generate(question, context)
-        else:
+        if not context:
             answer = "No relevant documents found for this query."
+        else:
+            try:
+                answer = _llm_provider.generate(question, context)
+            except Exception as e:
+                answer = (
+                    f"[LLM generation unavailable: {type(e).__name__}] "
+                    f"Retrieved {len(results)} documents. "
+                    f"Set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable generated answers."
+                )
 
     return {
         "strategy": name,
