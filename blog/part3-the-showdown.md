@@ -1,121 +1,224 @@
-# The Showdown: Vector vs Graph vs Graph+Vector
+# Building the GraphRAG Demo: 391 SCOTUS Cases, Four Retrieval Strategies
 
-Time to put these three strategies in the ring. Same stack, same questions, three retrieval approaches, and differences you can actually measure. I've been building toward this moment for two blog posts and honestly? I was a little nervous the combined approach wouldn't pull its weight. Spoiler: it does, but not always, and the "not always" part is the interesting bit.
+You're about to wire real Supreme Court data into the stack from Part 2 and prove, with actual query results, that graph plus vector plus hybrid beats any one approach on the questions that matter. I'll show you the architecture, the dataset, the four retrieval strategies, the multi-hop query detection logic, and a handful of places where I got it wrong the first time and had to start over. By the end you'll have a working demo running on 391 real SCOTUS cases and a clear path to swap in your own data.
 
-## Fire it up
+Fair warning: this is a walkthrough, not a copy-paste tutorial. The point is understanding why each piece exists so you can adapt it, not cargo-culting a repo and hoping. I have thoughts, and some of them are going to save you a week.
 
-If you've been following along, you already know the drill. From the `graphrag-demo` directory:
+## The dataset
 
-```bash
-docker compose up --build
+391 real Supreme Court cases from the 2018 through 2023 terms. Each case lives as a markdown file with a predictable structure: metadata at the top (docket number, citation, term, petitioner, respondent), then sections for Question Presented, Summary, Facts of the Case, Decision, and a Vote Breakdown listing every justice's vote. Roughly 2.5MB of text total. Ships inside the Docker image, so there are no external dependencies, no API keys, no "oh by the way you also need to clone this 40GB corpus" surprises.
+
+From that raw text we extract five things. Case metadata becomes `Case` nodes. Per-justice votes become `VOTED_MAJORITY` and `VOTED_DISSENT` edges. Opinion authors get pulled out of the Decision text via a pile of regex patterns and become `WROTE_OPINION` edges. Issue classification runs keyword matching against a fixed taxonomy of 15 legal areas (First Amendment, Antitrust, Criminal Procedure, and so on) to create `CONCERNS` edges. And citations between cases become `CITED` edges when one case mentions another by name in its decision text. The regex for opinion authors hits about 85%. The other 15% are per curiam opinions and unusual phrasings that would need an LLM to parse cleanly. Good enough for a demo. Not good enough if you're trying to publish legal research.
+
+Now the self-deprecating bit. The first time I built this, I used synthetic data. Fake companies, fake projects, fake incident reports, all procedurally assembled to "showcase" the retrieval strategies. It looked great in screenshots. Then I tried to prove the graph-plus-vector thesis and realized I'd correlated the content and the structure so perfectly that every strategy returned the same top five results. The demo proved nothing. Switching to real SCOTUS data was the fastest way to stop lying to myself.
+
+## The graph schema
+
+Here's the schema we land on, straight from `postgres/initdb/03-graph-schema.sql`:
+
+```sql
+SELECT ag_catalog.create_graph('org_graph');
+
+-- SCOTUS labels
+SELECT ag_catalog.create_vlabel('org_graph', 'Case');
+SELECT ag_catalog.create_vlabel('org_graph', 'Justice');
+SELECT ag_catalog.create_vlabel('org_graph', 'Issue');
+
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_MAJORITY');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_DISSENT');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_CONCURRING');
+SELECT ag_catalog.create_elabel('org_graph', 'WROTE_OPINION');
+SELECT ag_catalog.create_elabel('org_graph', 'CITED');
+SELECT ag_catalog.create_elabel('org_graph', 'CONCERNS');
 ```
 
-Give it a minute to seed. Then open `http://localhost:8000` in a browser.
+Three entity types, six relationship types. That's the whole SCOTUS model. I keep pushing people to start small with graph schemas and it keeps being the right advice. If you can't explain every label to a new engineer in under two minutes, you've designed something you're going to resent in six months.
 
-What you'll see is pretty simple. A search bar at the top. Three columns underneath labeled Vector, Graph, and Combined. A row of example queries you can click so you don't have to type. Hit one, and all three columns fill in at the same time with whatever each strategy thinks is the right answer. No fancy animations. No loading spinners that lie to you. Just three retrieval paths racing for the same prize.
+The same `org_graph` also holds a second example dataset (Person, Team, Project, Service, Technology) from an earlier iteration. AGE is perfectly happy storing multiple entity types in one graph, which lets both demos coexist on the same infrastructure.
 
-I built this demo app specifically to avoid the thing I hate about most RAG demos, which is that they show you the winning answer and hide everything else. I want you to see all three so you can judge for yourself when one beats the others and when they tie. Confession: my first version of this UI was a single answer box with a dropdown to pick the strategy. I stared at it for about an hour, felt dumb, and rewrote it as three columns. The comparison was the whole point and I'd almost hidden it behind a select element. Classic Yonk move.
+The bridge between graph and vector is the important part, and it's simpler than you'd think. The `documents` table has two columns, `author_id` and `project_id`, which for SCOTUS docs map to a Justice id and a Case id respectively. Those ids are the same ids we use as graph node identifiers. So when vector search returns a document, you already know which graph nodes to walk from. That's how the combined strategy stitches the two worlds together: vector finds semantically similar docs, you grab the ids off the results, and then you traverse the graph from there. No separate "mapping table," no duplicated state, just the same string appearing in two places.
 
-The example queries at the top of the page are the four we're about to walk through. They're there because I wanted to pick queries that would make the tradeoffs obvious without cherry-picking. Two of them vector wins or ties. Two of them graph wins or changes the game. That's roughly the ratio I see in real workloads, and it's why "just use vector" is not a terrible default but also not the final answer.
+## The four retrieval strategies
 
-## Query 1: "What was decided about the billing migration?"
+Four strategies, one demo. Each one is a separate Python class, each one gets called in parallel from the API, and each one returns a list of `RetrievedItem` objects that the UI renders side by side.
 
-Click it. Watch what happens.
+**Vector-only** is the boring one. Embed the question, run cosine similarity via the pgvector HNSW index, return the top k. From `app/retrieval/vector.py`:
 
-Vector goes straight to the decision doc. The one titled "Billing Migration: Final Architecture Decision" with an embedding that lines up almost perfectly with the question. It pulls two or three adjacent chunks for context and hands back a clean answer about which database the team picked and why. Takes about 50 milliseconds total. It's not wrong. It's actually really good.
+```sql
+SELECT title, content, doc_type,
+       1 - (embedding <=> %s::vector) AS similarity,
+       author_id, project_id
+FROM documents
+ORDER BY embedding <=> %s::vector
+LIMIT %s
+```
 
-Graph struggles here. "Billing migration" is a project name in our knowledge graph, sure, but the question isn't asking about structure. It's asking about content. Graph finds the Billing Migration project node, walks to its owner team, pulls adjacent entities, and returns a bunch of metadata that doesn't actually answer the question. It's like asking your buddy what the score of the game was and he tells you the stadium's address.
+One query. Fast. Good when the question is "find me something that looks like X."
 
-Combined basically echoes vector. The vector hits dominate the ranking, the graph context gets used to boost one result, and the output looks nearly identical to the vector column. It costs more to produce the same answer.
+**Hybrid** runs vector search and Postgres full-text search (BM25-style) and merges the two ranked lists with Reciprocal Rank Fusion. The FTS half looks like this:
 
-Here's the honest take: if every question your users ask sounds like "what was decided about X," you don't need any of this. Vector-only is the right answer. It's cheap, it's fast, and it's built for exactly this. Close the tab. Go ship your feature. I'm not offended.
+```sql
+SELECT id, title, content, doc_type,
+       ts_rank_cd(
+           to_tsvector('english', title || ' ' || content),
+           plainto_tsquery('english', %s)
+       ) AS rank
+FROM documents
+WHERE to_tsvector('english', title || ' ' || content) @@ plainto_tsquery('english', %s)
+ORDER BY rank DESC
+LIMIT %s
+```
 
-The graph stuff starts earning its keep when the questions get weirder.
+RRF is the fusion trick. Each document gets a score of `1 / (k + rank)` from each list it appears in, the scores are summed, the documents get re-sorted. k is 60 by tradition (the original RRF paper picked it and nobody has beaten it convincingly). It's elegant because it doesn't require the two scores to be on the same scale. Cosine similarity and BM25 live in completely different number spaces, but RRF doesn't care about the numbers, only the ranks.
 
-## Query 2: "Who should I talk to about the payment service?"
+**Graph-only** is where things get interesting. Extract entities from the question, match them against known graph entities, then decide what kind of query to run. For questions that match a single entity, walk one or two hops from it. For questions that match multiple entities (two justices, a justice and an issue, or a case), run a multi-hop pattern match.
 
-This is the one that made me sit up straight the first time I ran it.
+Here's what one of those multi-hop Cypher queries actually looks like, from `_multihop_justice_justice` in `app/retrieval/graph.py`:
 
-Vector returns three documents that mention payments. An old incident report about a payment gateway timeout. A runbook chunk about refund processing. A Slack export where somebody complained about Stripe webhooks. All related to payments. None of them tell you who to talk to. The word "owner" doesn't appear anywhere in the top results because nobody writes docs titled "Here Is The Owner Of The Payment Service, Please Email Them." That's not how humans write.
+```python
+cur.execute(
+    f"SELECT * FROM cypher('org_graph', $$ "
+    f"MATCH (j1:Justice {{id: '{j1_id}'}})-[:VOTED_DISSENT]->(c:Case)"
+    f"<-[:VOTED_DISSENT]-(j2:Justice {{id: '{j2_id}'}}) "
+    f"RETURN c.id, c.name, 'dissented together' "
+    f"$$) AS (id agtype, name agtype, relation agtype);"
+)
+```
 
-Graph does something completely different. It pulls "payment service" out of the question, matches it to the `Service` node named Payment Service, then walks one hop to find the `Team` that owns it. From the team node, it walks to the `Person` nodes who are members. It returns: Payment Service is owned by the Platform Engineering team. Alice is the team lead. Bob and Maya are the other engineers. There's your answer. In about 120 milliseconds, start to finish.
+Read that pattern literally. "Find a case where justice one dissented AND justice two also dissented, and give me back the case." That's one query, one traversal, one answer. Now try expressing that in pgvector. Try expressing it in full-text search. You can't. You'd have to pull down every case's vote breakdown, parse each one, and intersect the results in your application code. The graph just does it as a pattern. This is where graph earns its keep, and no amount of clever embedding tricks is going to close the gap.
 
-Combined puts both columns together and it's the best version of the answer. You get the ownership chain from the graph side (team, lead, engineers) and the three relevant docs from the vector side (past incidents, the runbook, the Slack context). So when you walk over to Alice's desk, you're not starting cold. You already know what's been going on with her service. That's the difference between "who do I ask" and "I'm prepared for this conversation."
+**Combined** (the one I've been calling GraphRAG) runs vector, hybrid, and graph in parallel, plus a graph expansion stage that takes the top vector results and walks out from them to find related cases through citation chains and shared issues. Everything gets merged and then reranked with a weighted scoring function in `app/retrieval/combined.py`:
 
-Put the three columns side by side and you can literally watch the two retrieval styles argue with each other. Vector is pattern-matching text. Graph is walking a skeleton. Combined is doing both and merging. This query is the moment the demo earns its keep, and if you only run one query from the example list, run this one.
+```python
+if item.source == "vector":
+    combined_score = item.score * vector_weight
+elif item.source == "graph":
+    combined_score = item.score * graph_weight
+elif item.source == "graph_expanded":
+    combined_score = item.score * graph_weight * 0.7
+elif item.source == "hybrid":
+    combined_score = item.score * hybrid_weight * 10
+```
 
-## Query 3: "What's the blast radius if the auth service goes down?"
+Vector and graph each get 0.4 weight, hybrid gets 0.2 (then multiplied by 10 because RRF scores are tiny). Graph-expanded results get a 30% discount versus direct graph hits because they're second-degree matches. This is the "use all the signals and let the ranker sort it out" approach, and it's the closest thing we have to a production path.
 
-Now we're playing the actual game.
+## Multi-hop query detection
 
-Vector finds the historical incident reports. The time auth went down for 40 minutes in February and took the mobile app with it. The postmortem where somebody wrote "we should really map our dependencies someday." (We did. You're reading about it.) Useful context but not the answer. Vector can't tell you what's currently depending on auth because "depending on" is a relationship, not a phrase.
+The fun part of the graph retrieval isn't the Cypher. It's the code that decides which Cypher to run.
 
-Graph walks the dependency edges. From the Auth Service node, it follows `DEPENDS_ON` edges in reverse to find everything that points at it. Payment Service depends on auth. Search depends on auth. Analytics depends on auth. Then from each of those services it walks one more hop: which projects are currently using Payment (Billing Migration), Search (Search Redesign), Analytics (Analytics Dashboard Q2). That's the blast radius. Three services, three projects, immediate downstream impact.
+`GraphRetrieval.retrieve` starts by loading the known-entities dictionary (every Case, Justice, and Issue in the graph) and doing case-insensitive substring matching against the question. Plus a last-name-only fallback for justices because people say "Sotomayor" more often than "Sonia Sotomayor." Then it counts how many entities matched and dispatches:
 
-Combined stitches all of it together. Dependency chain from the graph. Incident history from the vector hits. Responsible humans from the graph (because you're gonna want to ping the Platform team and the Search team at the same time). You hit enter once and get an answer that would've taken you 15 minutes of Slack archaeology to assemble by hand.
+```python
+justices = [(l, eid) for l, eid in matched if l == "Justice"]
+issues = [(l, eid) for l, eid in matched if l == "Issue"]
+cases = [(l, eid) for l, eid in matched if l == "Case"]
 
-Here's the timing breakdown on this query:
+# Case A: Two or more justices -> cases they voted together on
+if len(justices) >= 2:
+    used_multihop = True
+    for i in range(len(justices)):
+        for j in range(i + 1, len(justices)):
+            pairs = _multihop_justice_justice(
+                cur, justices[i][1], justices[j][1]
+            )
+            ...
 
-- **Vector:** ~50ms (embed 15ms, HNSW search 35ms)
-- **Graph:** ~120ms (entity extract 5ms, AGE traversal 115ms)
-- **Combined:** ~180ms (all of the above plus 60ms for graph expansion and result rerank)
+# Case B: Justice + Issue -> cases about issue that justice voted on
+if justices and issues:
+    used_multihop = True
+    ...
 
-The combined path costs about 130ms more than vector alone. For an incident response question where you're trying to figure out what's on fire, 180ms is nothing. You'd happily wait a full second for that answer. The cost only matters if you're serving it at Google scale, and if you're serving it at Google scale you have problems I can't help you with in a blog post.
+# Case C: Case mentioned -> citation chain
+if cases:
+    used_multihop = True
+    ...
+```
 
-## Query 4: "Catch me up on what the data team has been working on"
+If none of those patterns hit, we fall back to single-entity traversal: walk one and two hops from each matched entity and return whatever docs are attached.
 
-This one's for anyone who's ever prepped for a 1:1 at 9:57 AM for a 10:00 AM meeting.
+So what does that actually mean? It means intent detection in this demo is basically a partition of the matched entities by label, with a hardcoded dispatch table. That's it. There's no LLM parsing the question, no fancy NL-to-Cypher translator. It's substring matching plus a decision tree. A proper production system would use an LLM to generate the Cypher directly, which is a real pattern called text-to-Cypher. But for a demo, and honestly for a lot of real apps where the query vocabulary is predictable, this minimum-viable version gets you maybe 80% of the value at maybe 1% of the cost. Don't reach for an LLM when a dispatch table will do.
 
-Graph walks from the Data Team node through `MEMBER_OF` edges to find everyone on the team, then through `WORKS_ON` edges to find every project those people are attached to. Clean list. Five people, three projects, two cross-team collaborations. Done.
+## The side-by-side demo UI
 
-Vector finds a scatter of data-adjacent docs. The quarterly data platform review. A pull request description for the new dbt model. A meeting note where somebody mentioned the warehouse migration. All relevant, all disconnected, all pulled together by semantic similarity instead of structure.
+The UI is deliberately boring. A FastAPI static page at `http://localhost:8000` with a search bar, a row of pre-loaded example queries, and four columns labeled Vector, Hybrid, Graph, and Graph+Vector+Hybrid. Hit an example or type your own, and all four columns fill in simultaneously with the retrieved results, the LLM-generated answer, and a little stacked bar chart showing where each strategy spent its time (embedding, vector search, graph traversal, reranking, LLM generation).
 
-Combined gives you the org picture (team, people, projects) plus the recent activity (docs, PRs, notes) plus the cross-team dependencies (who the data team has been trading tickets with). It's exactly the briefing you wanted when you typed the question. This is the use case where my RAG-skeptic friends get quiet, because "catch me up on X" is the query that generic chatbots have been failing at for two years and this is what actually fixes it.
+The example queries come from `EXAMPLE_QUERIES` in `app/main.py` and each one carries a dataset badge (acme or scotus) so you can tell which world you're in. The ACME examples exercise the knowledge-base side (ownership chains, blast radius). The SCOTUS examples exercise the judicial side (justice voting patterns, issue intersections, multi-hop pattern matching). When you run one of the multi-hop SCOTUS queries, you can watch the graph column pull ahead of the others visibly, which is the single most satisfying thing I've put in a demo UI this year.
 
-## When to use what
+I built this UI specifically to avoid the thing I hate about most RAG demos, where they show you the winning answer and hide the losers. My first version was a single answer box with a dropdown to pick the strategy. I stared at it for an hour, felt dumb, and rewrote it as four columns. The comparison was the whole point and I'd almost hidden it behind a select element. I do this kind of thing constantly.
 
-Here's the cheat sheet. Print it, tape it to your monitor, whatever.
+## Real query results
 
-**Vector-only is the right answer when:**
+Enough setup. Let's run three queries and see what actually comes back.
 
-- The question is semantic. "Find me the doc about X."
-- You're doing FAQ retrieval, content search, or help-center stuff.
-- You care about cost and latency more than completeness.
+### Query 1: "Find cases about administrative overreach"
 
-**Graph-only earns its keep when:**
+Vector wins this cleanly. The question is pure topical match and vector is built for exactly that. The top results are cases where administrative agency authority was the central issue, pulled in by semantic similarity between the question and the case summaries. Hybrid adds a small bump from FTS matching the word "administrative" but the results are mostly the same set reordered. Graph returns nothing useful because the question doesn't name any specific entity; "administrative overreach" isn't a Justice, Case, or Issue, it's a theme. And combined ends up dominated by vector because that's where the relevant signal lives.
 
-- The question is structural. "Who owns this," "what depends on that."
-- The question contains named entities your graph actually knows about.
-- You're doing org lookups, dependency analysis, or impact planning.
+The lesson is the one nobody wants to hear: you don't need graph for this question. Vector or hybrid is enough. If every question your users ask is some version of "find me stuff about X," close this tab, go add pgvector to your app, and ship your feature. The graph machinery is overhead you don't need.
 
-**Combined is worth the extra 100ms when:**
+The graph starts earning its keep when the questions get weirder.
 
-- The question is investigative. "Catch me up," "what should I know about."
-- The user doesn't know what they don't know yet.
-- The answer matters enough that you'd rather get it right than get it fast.
+### Query 2: "Which cases did Justice Thomas and Justice Sotomayor vote together on?"
 
-And one rule that overrides all three: you don't have to pick one strategy for your whole app. Run multiple paths in parallel, merge the results, or let the user flip between them. The demo does exactly that. It's not hard. It's just that nobody bothers because the tutorials all show you one strategy at a time and you assume that's the shape of the world.
+This is the one I built the demo around, so I want to walk through it carefully.
 
-## Production considerations (the short version)
+Vector returns documents that are semantically close to "voting" and "together." You get Colorado Department of State v. Baca (a case about faithless electors), Acheson Hotels v. Laufer (about a plaintiff's standing to sue), and a handful of other docs where the content talks about voting in some generic sense. These are topical matches. They do not answer the question. The question is asking for an intersection of two voting relationships, and nothing in the embedding space encodes that intersection because nobody writes case summaries that say "Justice Thomas and Justice Sotomayor voted together on this one."
 
-I'm not going to write a 3,000-word ops guide here. But if you're taking this from demo to prod, here's the stuff that'll bite you:
+Hybrid returns roughly the same set. The FTS boost helps with literal keyword matches on "Thomas" and "Sotomayor," which nudges a couple of results up, but the top docs are still semantically-related-to-voting rather than structurally-answering-the-question.
 
-- **HNSW tuning.** The default `m` and `ef_construction` values are fine for 10,000 docs and wrong for 10 million. Tune for your dataset size or pay the recall tax.
-- **Graph schema restraint.** Fewer edge types almost always beats many. I've seen teams ship graphs with 40 edge types and nobody could remember what any of them meant six months later. Start with five. Earn the sixth.
-- **Cache entity lookups.** Graph queries for simple "find this entity by name" patterns are shockingly slow compared to a Redis hit. Cache them.
-- **Batch your embeddings when seeding.** One embedding API call per doc is how you turn a 10-minute seed into an afternoon.
-- **Push work into AGE when the graph gets huge.** If you're doing traversals in Python that Cypher could do in one query, stop. The app server is not where graph math should live.
+Graph runs the multi-hop Cypher from earlier (the `(:Justice)-[:VOTED_MAJORITY]->(:Case)<-[:VOTED_MAJORITY]-(:Justice)` pattern) and returns the actual cases where both justices were in the majority together: Muldrow v. City of St. Louis, Moody v. NetChoice, McIntosh v. United States, and the other cases that genuinely match. Each result carries an explanation string: "Multi-hop pattern match: voted majority together." That's not a guess from semantic similarity. That's a structural answer pulled from a pattern match.
 
-That's it. The rest you'll learn by breaking things, which is how I learned it too.
+Combined interleaves vector, hybrid, and graph. Because graph results score 0.95 on these pattern-match queries and vector results typically score 0.6 to 0.8 on cosine similarity, the graph results rise to the top of the merged list. You get the structural answer first and the topical context second.
+
+Look, this is the demo. The graph does in 13 milliseconds what no hybrid search on earth can do correctly in any number of queries. When the question is an intersection of relationships, the right tool is the one that models relationships as a first-class citizen. That's not a hot take. That's just what the data structure is for.
+
+### Query 3: "What First Amendment cases did Justice Sotomayor vote on?"
+
+Justice plus Issue. This hits the `_multihop_justice_issue` branch, which runs a pattern that walks from the Justice node through a vote edge to a Case and then through a CONCERNS edge to the Issue node for First Amendment. Graph returns the exact set of cases where Sotomayor voted and the case concerned the First Amendment. Vector returns cases with the words "First Amendment" and "Sotomayor" somewhere in the text, which overlaps but isn't the same set and isn't ordered by the actual question. Combined picks up the graph results and uses vector to fill in context.
+
+This is the second thing that makes the demo sing: any query that needs to intersect two different kinds of relationships (person plus topic, person plus time, entity plus property) gets much better answers from a graph than from a keyword or semantic search. If you're building something where users are going to ask "show me X from Y" or "which Xs are related to both Y and Z," you already need a graph. You just don't know it yet.
+
+## Performance observations
+
+Real numbers from verified runs on my laptop:
+
+- **Vector** runs in about 40ms end to end once the embedding model is warm. The first query after startup pays a ~1000ms penalty while sentence-transformers loads its weights. Cache the model, warm it at startup, and you never see that cost again. (If you see it on every query, your container is thrashing and you have a memory problem.)
+- **Hybrid** takes roughly 2x vector alone because it runs two index scans (HNSW and GIN) and then fuses the results. The RRF fusion itself is microseconds. The bottleneck is running two queries.
+- **Graph** runs in 5 to 15 milliseconds for multi-hop Cypher patterns because AGE compiles them to native Postgres operators against indexed vertex and edge tables. Entity extraction on the question adds 1 to 3 milliseconds. The total graph path is often faster than vector because it doesn't have to embed anything.
+- **Combined** is roughly the max of the four component paths plus a small reranking step, so 40 to 80 milliseconds after warmup. It runs the four strategies in a thread pool, so the costs overlap rather than stack.
+
+The pattern I keep hammering: graph queries are fast when your graph is modeled right, because most graph questions only touch a handful of nodes. The slow part isn't the database, it's the embedding model. Cache it, warm it, batch the seed inserts.
+
+## Adapting this to your own dataset
+
+Here's the replication path for the reader who wants to swap in their own problem:
+
+1. **Design your entity types and relationships first.** What are the nouns in your domain? What are the verbs? Aim for 3 to 8 entity types and 4 to 10 edge types. If you're tempted to go above that, stop and ask which ones you actually need for the questions you want to answer. Over-schema is the most common way I've seen graph projects die.
+2. **Add your vertex and edge labels** in `postgres/initdb/03-graph-schema.sql`. One `create_vlabel` per entity, one `create_elabel` per relationship.
+3. **Write a parser for your raw data.** Ours is a markdown parser in `app/seed/scotus_data.py`, but it could be JSON, CSV, database queries, or API calls. Output the same structure: a list of nodes per label, a list of edges per label, and a list of documents where each document has `author_id`, `project_id`, and `dataset` fields that reference graph node ids.
+4. **Update `app/seed/seed.py`** to call your loader and insert the data. Copy the patterns from the SCOTUS loader.
+5. **Add multi-hop pattern functions** to `app/retrieval/graph.py` for the relationships your queries will follow. One function per query pattern. Wire them into the dispatch block in `GraphRetrieval.retrieve`.
+6. **Add example queries** in `app/main.py` that exercise each strategy so you can compare them side by side in the UI.
+7. **Run, query, break, iterate.** The first schema is never right. Mine wasn't. Yours won't be either.
+
+The hardest step is step one, and I can't do it for you from a blog post. Take time on it. Draw the nodes on paper before you touch SQL. Your schema determines which questions you can ask, and adding an edge type later is cheap, but restructuring after you've indexed a million documents is not.
+
+## Where we'd go next
+
+Things I'd do if this were a production system instead of a demo:
+
+1. **Text-to-Cypher with an LLM.** Substring matching plus a dispatch table is fine for a small number of query shapes. For a real product where users can ask anything, let an LLM generate the Cypher from the question. It's the right tool for the job.
+2. **Cross-encoder reranking.** RRF is decent. A cross-encoder model that scores (query, document) pairs on the top 20 to 50 results is measurably better. Add it after the combined merge and before the final top k.
+3. **Cache entity lookups.** We reload the full known-entities dict from the graph on every query. It's small so it doesn't matter, but in a graph with millions of entities you'd precompute a name-to-id index or use a bloom filter.
+4. **Embedding model as a dedicated service.** Running sentence-transformers inside the API container is fine for a demo. For production, move it out, batch requests, and run it on hardware that actually wants to do matmul.
+5. **Real distributed tracing.** We have stage timings per query, which is cute, but debugging a production RAG pipeline needs OpenTelemetry spans across the whole request. Do that from day one. You'll thank yourself.
+
+None of this is exotic. The demo skips it because the demo is about showing the retrieval strategies, not shipping a product. Don't confuse the two.
 
 ## Your turn
 
-Your RAG pipeline right now is almost certainly vector-only. I know this because I've looked at maybe 30 production RAG systems in the last year and all but two of them were vector-only. It's the default. It's not wrong. But I want you to do one thing for me.
+Clone the repo. Run `docker compose up`. Ask your own questions. If every strategy returns the same top five results, your questions are too easy or your data is too correlated. Find a question where the strategies disagree. That's the one that matters. That's the question where your users get bad answers today and where a graph is going to rescue you tomorrow.
 
-Go look at your query logs. Pull the questions your users are actually asking. I bet at least 20% of them are structural ("who," "what depends on," "catch me up"), and I bet your current pipeline is answering those badly or not at all. Those are the questions a graph can eat for breakfast. That's where this matters. Not everywhere. Just where it matters.
+Where I'd start: pull a week of query logs from whatever app you're building. Find the questions that start with "who," "which," or "what depends on." Run those through the demo with your data loaded. I'll bet you a coffee that at least a fifth of them return completely different top results from graph versus vector. Those are the ones you're answering badly right now, and they're fixable with 200 lines of Cypher and a weekend of schema design.
 
-So clone the demo. Point it at your own data. Break it in ways I didn't think of. Find the query where graph+vector produces something you couldn't get any other way, and then go tell somebody on your team about it. Or tell me. I want to know what you find, especially the failures, because the failures are where the next blog post lives.
-
-Oh, and if you build something cooler than my three-column demo, don't make me find out about it on Hacker News six months from now. Ping me. The HOSS wants to see it.
-
-Now go break some stuff.
+Now stop reading and go break it. If you find something weird, or something better than what I built, tell me about it. The HOSS wants to see it.
