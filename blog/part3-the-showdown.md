@@ -42,7 +42,7 @@ Graph does something completely different. It pulls "payment service" out of the
 
 Combined puts both columns together and it's the best version of the answer. You get the ownership chain from the graph side (team, lead, engineers) and the three relevant docs from the vector side (past incidents, the runbook, the Slack context). So when you walk over to Alice's desk, you're not starting cold. You already know what's been going on with her service. That's the difference between "who do I ask" and "I'm prepared for this conversation."
 
-Look at the three columns side by side and you can literally see the retrieval paradigms arguing with each other. Vector is pattern-matching text. Graph is walking a skeleton. Combined is doing both and merging. This query is the moment the demo earns its keep, and if you only run one query from the example list, run this one.
+Put the three columns side by side and you can literally watch the two retrieval styles argue with each other. Vector is pattern-matching text. Graph is walking a skeleton. Combined is doing both and merging. This query is the moment the demo earns its keep, and if you only run one query from the example list, run this one.
 
 ## Query 3: "What's the blast radius if the auth service goes down?"
 
