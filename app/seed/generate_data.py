@@ -238,7 +238,7 @@ def generate_documents() -> list[dict]:
 
     for doc_type, templates in ALL_TEMPLATES.items():
         # Generate multiple docs per template
-        iterations = 4 if doc_type == "meeting_note" else 3
+        iterations = 16 if doc_type == "meeting_note" else 10
         for template_title, template_content in templates:
             for _ in range(iterations):
                 # Pick a random author
