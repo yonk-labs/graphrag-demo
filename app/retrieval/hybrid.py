@@ -14,6 +14,13 @@ RRF_K = 60  # RRF constant
 class HybridRetrieval:
     def __init__(self, embedding_provider: EmbeddingProvider):
         self.embedding_provider = embedding_provider
+        # Tracks the highest raw vector cosine similarity observed in the last
+        # retrieve() call so callers (e.g. ProductionRetrieval) can gate behavior
+        # on raw vector confidence rather than RRF-fused scores.
+        # NOTE: not thread-safe if a single HybridRetrieval instance services
+        # concurrent queries. ProductionRetrieval uses a dedicated instance so
+        # this is fine for our use case.
+        self.last_max_vector_sim: float = 0.0
 
     def retrieve(
         self, question: str, top_k: int, timing: TimingResult
@@ -62,15 +69,21 @@ class HybridRetrieval:
         with timed_stage(timing, "rrf_fusion"):
             scores: dict = {}
             details: dict = {}
+            max_vector_sim = 0.0
 
             for rank, row in enumerate(vector_rows, start=1):
                 doc_id = str(row[0])
+                sim = float(row[4])
+                # vector_rows are ordered by distance ascending, so the first
+                # row carries the max cosine similarity.
+                if rank == 1:
+                    max_vector_sim = sim
                 scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (RRF_K + rank)
                 details[doc_id] = {
                     "title": row[1],
                     "content": row[2],
                     "doc_type": row[3],
-                    "vector_sim": float(row[4]),
+                    "vector_sim": sim,
                     "vector_rank": rank,
                 }
 
@@ -107,4 +120,5 @@ class HybridRetrieval:
                 explanation=f"RRF fusion: {' + '.join(signals)}",
             ))
 
+        self.last_max_vector_sim = max_vector_sim
         return results

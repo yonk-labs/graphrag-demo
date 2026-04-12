@@ -142,6 +142,7 @@ def _should_run_stage3(
     stage1_results: list[RetrievedItem],
     expand_explicit: bool,
     known_entities: dict,
+    max_vector_sim: float,
 ) -> tuple[bool, str]:
     """Decide whether Stage 3 should run. Returns (should_run, reason)."""
     if expand_explicit:
@@ -154,10 +155,10 @@ def _should_run_stage3(
     if len(matches) >= 2:
         return True, f"{len(matches)} entities detected in query"
 
-    if stage1_results:
-        top_scores = [r.score for r in stage1_results[:5]]
-        if top_scores and max(top_scores) < WEAK_CONFIDENCE_THRESHOLD:
-            return True, f"weak Stage 1 confidence (max score {max(top_scores):.3f})"
+    # Weak confidence: check the RAW top vector cosine similarity, not the
+    # RRF-fused score (which is in the 0.016 range and would always trigger).
+    if max_vector_sim < WEAK_CONFIDENCE_THRESHOLD:
+        return True, f"weak vector confidence (top cosine {max_vector_sim:.3f})"
 
     return False, "Stage 1+2 sufficient"
 
@@ -203,7 +204,10 @@ class ProductionRetrieval:
                 metadata["stages_run"].append("stage2_graph_boost")
 
         # Stage 3: Conditional Graph Expand
-        should_run, reason = _should_run_stage3(question, boosted_results, expand_graph, known_entities)
+        max_vector_sim = self.hybrid_retrieval.last_max_vector_sim
+        should_run, reason = _should_run_stage3(
+            question, boosted_results, expand_graph, known_entities, max_vector_sim
+        )
         metadata["trigger_reason"] = reason
 
         if should_run:
