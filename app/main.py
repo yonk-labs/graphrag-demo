@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
     _graph_retrieval = GraphRetrieval()
     _combined_retrieval = CombinedRetrieval(
         vector_retrieval=VectorRetrieval(_embedding_provider),
+        graph_retrieval=GraphRetrieval(),
     )
     yield
     close_pool()

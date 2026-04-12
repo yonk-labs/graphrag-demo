@@ -146,33 +146,29 @@ class GraphRetrieval:
                     timing.add("graph_traversal", 0.0)
                     return []
 
-                # Stage 2: Traverse graph from matched entities
+                # Stage 2: Traverse graph from matched entities; track hop distance
                 with timed_stage(timing, "graph_traversal"):
                     all_graph_nodes = []
                     for label, entity_id in matched:
                         nodes = _traverse_from_entity(cur, label, entity_id)
                         all_graph_nodes.extend(nodes)
 
-                    # Collect person and project IDs to find related docs
-                    person_ids = set()
-                    project_ids = set()
+                    # Track per-entity minimum hop (1 vs 2)
+                    entity_hops: dict[str, int] = {}
                     for node in all_graph_nodes:
-                        if "Person" in node["label"]:
-                            person_ids.add(node["id"])
-                        elif "Project" in node["label"]:
-                            project_ids.add(node["id"])
+                        eid = node["id"]
+                        hops = node["hops"]
+                        if eid not in entity_hops or hops < entity_hops[eid]:
+                            entity_hops[eid] = hops
 
-                    # Add the originally matched entity IDs too
+                    # Originally matched entities are hop 0 (treat as 1-hop for scoring)
                     for label, eid in matched:
-                        if label == "Person":
-                            person_ids.add(eid)
-                        elif label == "Project":
-                            project_ids.add(eid)
+                        entity_hops[eid] = 0
 
-                    all_entity_ids = list(person_ids | project_ids)
+                    all_entity_ids = list(entity_hops.keys())
                     doc_rows = _fetch_docs_for_entities(cur, all_entity_ids)
 
-        # Build results with graph context
+        # Build results with relevance-weighted scores
         results = []
         seen_titles = set()
         for row in doc_rows:
@@ -181,20 +177,45 @@ class GraphRetrieval:
                 continue
             seen_titles.add(title)
 
-            # Build explanation from graph path
+            author_id = row[3]
+            project_id = row[4]
+            doc_type = row[2]
+
+            # Minimum hop distance for this doc's key entities
+            hops_candidates = []
+            if author_id in entity_hops:
+                hops_candidates.append(entity_hops[author_id])
+            if project_id in entity_hops:
+                hops_candidates.append(entity_hops[project_id])
+            min_hops = min(hops_candidates) if hops_candidates else 2
+
+            # 0 or 1 hop = strong signal; 2-hop = weaker
+            if min_hops <= 1:
+                score = 0.9
+            else:
+                score = 0.5
+
+            # Prefer authoritative doc types
+            if doc_type in ("architecture_doc", "decision_record"):
+                score += 0.1
+
+            score = min(score, 1.0)
+
             entity_names = [f"{l}:{eid}" for l, eid in matched]
-            explanation = f"Found via graph traversal from {', '.join(entity_names)}"
+            explanation = (
+                f"Found via graph traversal from {', '.join(entity_names)} "
+                f"({min_hops}-hop)"
+            )
 
             results.append(RetrievedItem(
                 title=title,
                 content=row[1],
-                doc_type=row[2],
-                score=1.0 / (1 + len(results)),  # Rank by discovery order
+                doc_type=doc_type,
+                score=round(score, 4),
                 source="graph",
                 explanation=explanation,
             ))
 
-            if len(results) >= top_k:
-                break
-
-        return results
+        # Sort by score, take top_k
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:top_k]

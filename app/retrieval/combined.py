@@ -4,6 +4,7 @@ from models import RetrievedItem
 from timing import TimingResult, timed_stage
 from db import get_connection
 from retrieval.vector import VectorRetrieval
+from retrieval.graph import GraphRetrieval
 
 
 def rerank_results(
@@ -15,10 +16,12 @@ def rerank_results(
     Re-rank results by combining vector similarity and graph proximity.
     Deduplicates by title, keeping the highest-scoring version.
     """
-    # Deduplicate: keep best score per title
+    # Deduplicate: keep best score per title, but prefer complementary sources
+    # (so a doc found by BOTH vector and graph keeps the higher-weighted score)
     best_by_title: dict[str, RetrievedItem] = {}
     for item in items:
-        if item.title not in best_by_title or item.score > best_by_title[item.title].score:
+        existing = best_by_title.get(item.title)
+        if existing is None or item.score > existing.score:
             best_by_title[item.title] = item
 
     # Re-score based on source
@@ -26,8 +29,10 @@ def rerank_results(
     for item in best_by_title.values():
         if item.source == "vector":
             combined_score = item.score * vector_weight
-        elif item.source == "graph_expanded":
+        elif item.source == "graph":
             combined_score = item.score * graph_weight
+        elif item.source == "graph_expanded":
+            combined_score = item.score * graph_weight * 0.7
         else:
             combined_score = item.score
 
@@ -103,27 +108,39 @@ class CombinedRetrieval:
     def __init__(
         self,
         vector_retrieval: VectorRetrieval,
+        graph_retrieval: GraphRetrieval | None = None,
         graph_expand_fn: Callable | None = None,
     ):
         self.vector_retrieval = vector_retrieval
+        self.graph_retrieval = graph_retrieval
         self.graph_expand_fn = graph_expand_fn or _default_graph_expand
 
     def retrieve(
         self, question: str, top_k: int, timing: TimingResult
     ) -> list[RetrievedItem]:
-        # Stage 1+2: Vector search (reuses vector retrieval, timing recorded there)
+        # Stage 1+2: Vector search (semantic seeds)
         vector_results = self.vector_retrieval.retrieve(question, top_k=top_k, timing=timing)
 
-        # Stage 3: Graph expansion from vector seed results
-        graph_expanded = []
+        # Stage 3: Graph entity search (structural seeds from question entities)
+        graph_results: list[RetrievedItem] = []
+        with timed_stage(timing, "graph_entity_search"):
+            if self.graph_retrieval is not None:
+                try:
+                    sub_timing = TimingResult()
+                    graph_results = self.graph_retrieval.retrieve(
+                        question, top_k=top_k, timing=sub_timing
+                    )
+                except Exception:
+                    graph_results = []
+
+        # Stage 4: Graph expansion from vector seed results
+        graph_expanded: list[RetrievedItem] = []
         with timed_stage(timing, "graph_expansion"):
             if vector_results:
                 try:
                     with get_connection() as conn:
-                        seen_titles = {r.title for r in vector_results}
-                        for vr in vector_results[:5]:  # Expand top 5 seeds
-                            # Extract author_id and project_id from the vector result
-                            # We need to re-query for these since RetrievedItem doesn't carry them
+                        seen_titles = {r.title for r in vector_results} | {r.title for r in graph_results}
+                        for vr in vector_results[:5]:
                             with conn.cursor() as cur:
                                 cur.execute(
                                     "SELECT author_id, project_id FROM documents WHERE title = %s LIMIT 1",
@@ -137,11 +154,11 @@ class CombinedRetrieval:
                                             graph_expanded.append(item)
                                             seen_titles.add(item.title)
                 except Exception:
-                    pass  # Graph expansion is best-effort
+                    pass
 
-        # Stage 4: Re-rank combined results
+        # Stage 5: Re-rank combined results
         with timed_stage(timing, "reranking"):
-            all_results = vector_results + graph_expanded
+            all_results = vector_results + graph_results + graph_expanded
             reranked = rerank_results(all_results)
 
         return reranked[:top_k]

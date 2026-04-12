@@ -225,43 +225,143 @@ def _pick_others(exclude_id: str, team_id: str | None = None, count: int = 3) ->
     return random.sample(pool, min(count, len(pool)))
 
 
+# Subject types per template index (matches order in templates.py)
+TEMPLATE_SUBJECTS = {
+    "meeting_note": ["project", "team", "cross_team", "one_on_one", "project"],
+    "architecture_doc": ["service", "project", "project"],
+    "incident_report": ["service", "service"],
+    "decision_record": ["project", "service", "project"],
+}
+
+
 def generate_documents() -> list[dict]:
-    """Generate ~160 documents using templates and real entity references."""
-    people = _people_by_id()
-    projects = _projects_by_id()
-    services = _services_by_id()
+    """Generate ~160 documents using templates and real entity references.
+
+    Each template has a 'subject type' that drives how author/project/service are
+    picked so graph relationships correlate with document content. This lets graph
+    traversal surface docs via ownership/membership chains even without a semantic
+    match, which is the whole point of the demo.
+    """
     teams = _teams_by_id()
-    techs = _techs_by_id()
 
     docs = []
     doc_id = 0
 
     for doc_type, templates in ALL_TEMPLATES.items():
-        # Generate multiple docs per template
         iterations = 16 if doc_type == "meeting_note" else 10
-        for template_title, template_content in templates:
+        for template_idx, (template_title, template_content) in enumerate(templates):
+            subject_type = TEMPLATE_SUBJECTS[doc_type][template_idx]
             for _ in range(iterations):
-                # Pick a random author
-                author = random.choice(PEOPLE)
-                others = _pick_others(author["id"], author["team_id"], count=4)
-                team = teams[author["team_id"]]
+                person2_candidate_id = None
+                team_subject = None
 
-                # Pick a second team different from author's
+                if subject_type == "service":
+                    svc_subject = random.choice(SERVICES)
+                    svc = svc_subject
+                    owning_team_id = next((t for t, s in OWNS if s == svc_subject["id"]), None)
+                    if owning_team_id and random.random() < 0.7:
+                        candidates = [p for p in PEOPLE if p["team_id"] == owning_team_id]
+                    else:
+                        dep_projs = [s for s, t, _ in DEPENDS_ON if t == svc_subject["id"] and s.startswith("proj-")]
+                        if dep_projs:
+                            dep_proj = random.choice(dep_projs)
+                            worker_ids = {p for p, pr, _ in WORKS_ON if pr == dep_proj}
+                            candidates = [p for p in PEOPLE if p["id"] in worker_ids]
+                        else:
+                            candidates = [p for p in PEOPLE if p["team_id"] == owning_team_id] if owning_team_id else list(PEOPLE)
+                    author = random.choice(candidates) if candidates else random.choice(PEOPLE)
+                    dep_projs = [s for s, t, _ in DEPENDS_ON if t == svc_subject["id"] and s.startswith("proj-")]
+                    proj_id = random.choice(dep_projs) if dep_projs else None
+                    proj = next((p for p in PROJECTS if p["id"] == proj_id), None) or random.choice(PROJECTS)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                elif subject_type == "project":
+                    proj_subject = random.choice(PROJECTS)
+                    proj = proj_subject
+                    worker_ids = {p for p, pr, _ in WORKS_ON if pr == proj_subject["id"]}
+                    candidates = [p for p in PEOPLE if p["id"] in worker_ids]
+                    author = random.choice(candidates) if candidates else random.choice(PEOPLE)
+                    dep_svcs = [t for s, t, _ in DEPENDS_ON if s == proj_subject["id"]]
+                    svc = next((s for s in SERVICES if s["id"] in dep_svcs), None) or random.choice(SERVICES)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                elif subject_type == "team":
+                    team_subject = random.choice(TEAMS)
+                    candidates = [p for p in PEOPLE if p["team_id"] == team_subject["id"]]
+                    author = random.choice(candidates) if candidates else random.choice(PEOPLE)
+                    team_member_ids = {p["id"] for p in candidates}
+                    team_proj_ids = list({pr for p, pr, _ in WORKS_ON if p in team_member_ids})
+                    if team_proj_ids:
+                        chosen = random.choice(team_proj_ids)
+                        proj = next((p for p in PROJECTS if p["id"] == chosen), random.choice(PROJECTS))
+                    else:
+                        proj = random.choice(PROJECTS)
+                    svc = random.choice(SERVICES)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                elif subject_type == "cross_team":
+                    proj = random.choice(PROJECTS)
+                    worker_ids = {p for p, pr, _ in WORKS_ON if pr == proj["id"]}
+                    candidates = [p for p in PEOPLE if p["id"] in worker_ids]
+                    author = random.choice(candidates) if candidates else random.choice(PEOPLE)
+                    svc = random.choice(SERVICES)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                elif subject_type == "one_on_one":
+                    managers = list({m for _, m in REPORTS_TO})
+                    manager_id = random.choice(managers)
+                    author = next(p for p in PEOPLE if p["id"] == manager_id)
+                    reports = [p for p, m in REPORTS_TO if m == manager_id]
+                    person2_candidate_id = random.choice(reports) if reports else None
+                    if person2_candidate_id:
+                        report_projs = [pr for p, pr, _ in WORKS_ON if p == person2_candidate_id]
+                        if report_projs:
+                            chosen = random.choice(report_projs)
+                            proj = next((p for p in PROJECTS if p["id"] == chosen), random.choice(PROJECTS))
+                        else:
+                            proj = random.choice(PROJECTS)
+                    else:
+                        proj = random.choice(PROJECTS)
+                    svc = random.choice(SERVICES)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                else:
+                    author = random.choice(PEOPLE)
+                    proj = random.choice(PROJECTS)
+                    svc = random.choice(SERVICES)
+                    svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
+                    svc2 = random.choice(svc2_choices)
+                    svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
+                    svc3 = random.choice(svc3_choices) if svc3_choices else svc2
+
+                others = _pick_others(author["id"], author["team_id"], count=4)
+                team = team_subject if subject_type == "team" and team_subject else teams[author["team_id"]]
                 other_teams = [t for t in TEAMS if t["id"] != author["team_id"]]
                 team2 = random.choice(other_teams)
-
-                # Pick random projects, services, techs
-                proj = random.choice(PROJECTS)
                 proj2_choices = [p for p in PROJECTS if p["id"] != proj["id"]]
                 proj2 = random.choice(proj2_choices)
-
-                svc = random.choice(SERVICES)
-                svc2_choices = [s for s in SERVICES if s["id"] != svc["id"]]
-                svc2 = random.choice(svc2_choices)
-                svc3_choices = [s for s in SERVICES if s["id"] not in (svc["id"], svc2["id"])]
-                svc3 = random.choice(svc3_choices) if svc3_choices else svc2
-
                 tech_list = random.sample(TECHNOLOGIES, min(3, len(TECHNOLOGIES)))
+
+                # For 1:1, ensure person2 is the direct report (drives graph linkage)
+                if subject_type == "one_on_one" and person2_candidate_id:
+                    report_person = next((p for p in PEOPLE if p["id"] == person2_candidate_id), None)
+                    if report_person:
+                        others = [report_person] + [o for o in others if o["id"] != report_person["id"]][:3]
 
                 replacements = {
                     "author": author["name"],
