@@ -1,14 +1,112 @@
-# Building a Graph-Aware RAG Pipeline
+# Getting Apache AGE and pgvector Running on Postgres 16
 
-We ended Part 1 with vector search confidently returning documents that were technically relevant and practically useless. The model was happy. The user was not. Now we fix it.
+So you read Part 1, you're sold on the idea of running a graph database and a vector store inside the same Postgres instance, and now you're staring at a blinking cursor wondering how the hell you actually install this stuff. I've been there. The first time I tried to get Apache AGE running I lost an afternoon to a branch name typo and another hour to a missing CA certificate. Nobody writes this part down, so here we are.
 
-Here's the deal. Vector search alone is like asking a librarian who's read every book but never met another human. It knows what words mean next to each other, but it doesn't know that Sarah is on the payments team, that the payments team owns the auth service, and that the auth service is the reason your question even exists. That's structural knowledge. And you don't get structural knowledge from cosine similarity, no matter how many dimensions you throw at it.
+Here's the good news: it's simpler than it looks once you know the moves. Docker does the gnarly part for you, which is important because there's no reliable pre-built AGE image you can just pull. You're going to build it from source, but Docker is going to hide that fact from you after the first five minutes. By the end of this post you'll have a running Postgres 16 with pgvector and AGE both loaded, and you'll have run your first vector similarity query and your first Cypher traversal against it. Real queries, real output, no hand-waving.
 
-So in this post we're going to build three retrieval strategies on top of the same Postgres database: one using pgvector only, one using Apache AGE only, and one that combines them into something that actually behaves like a colleague who knows the org. I've been building data pipelines for 20-plus years, and I'll tell you up front: this combined strategy isn't some genius new algorithm I invented in the shower. It's plumbing. Good plumbing. But still plumbing.
+## What you need on your machine
 
-## The data model (the boring part that matters most)
+Prerequisites are boring but worth listing so nobody gets 400 words in and realizes they're missing something:
 
-Before any retrieval code, you need a graph. Apache AGE lets us declare nodes and edges as first-class citizens inside Postgres. Here's the whole schema, and yes, it's this short:
+- Docker and Docker Compose. Modern versions. If you're still typing `docker-compose` with a hyphen and it's the old Python script, upgrade. We're using `docker compose` (space, no hyphen) which ships with Docker Desktop and modern Docker Engine.
+- About 2GB of free disk for the image build. The base postgres:16 image plus the build toolchain plus the compiled extensions adds up.
+- Roughly 5 minutes of patience for the first build. After that it's cached and quick.
+- Basic SQL comfort. If you can write a JOIN you're fine.
+
+Notice what's not on the list: a local Postgres install. You don't need one. Docker handles everything.
+
+## The Dockerfile
+
+Here's the whole thing. It's 31 lines. I'll walk through it after.
+
+```dockerfile
+FROM postgres:16
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    git \
+    postgresql-server-dev-16 \
+    libreadline-dev \
+    zlib1g-dev \
+    flex \
+    bison \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+# Build and install pgvector 0.8.0
+RUN git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && cd /tmp/pgvector \
+    && make OPTFLAGS="" \
+    && make install \
+    && rm -rf /tmp/pgvector
+
+# Build and install Apache AGE 1.5.0 for PG16
+RUN git clone --branch release/PG16/1.5.0 --depth 1 https://github.com/apache/age.git /tmp/age \
+    && cd /tmp/age \
+    && make install \
+    && rm -rf /tmp/age
+
+# Preload AGE so LOAD is not needed per-session
+RUN echo "shared_preload_libraries = 'age'" >> /usr/share/postgresql/postgresql.conf.sample
+
+COPY initdb/ /docker-entrypoint-initdb.d/
+```
+
+We start from `postgres:16`, the official Debian-based image. Small, standard, well maintained. No reason to get clever here.
+
+The `apt-get install` block pulls the toolchain we need to compile two C extensions. `build-essential` gives us gcc and make. `postgresql-server-dev-16` gives us the Postgres headers and `pg_config`, which the extension Makefiles use to find where to install things. `libreadline-dev` and `zlib1g-dev` are linking dependencies. `flex` and `bison` are parser generators that AGE needs to build its Cypher grammar. `git` is obvious. And `ca-certificates` is the one that bit me the first time. Without it, `git clone https://github.com/...` fails with an SSL error and you sit there wondering why Git can't reach a perfectly reachable host. That `update-ca-certificates` line at the end is cheap insurance.
+
+Then we clone and build pgvector 0.8.0. Standard `make install` flow, nothing exotic. The `OPTFLAGS=""` flag tells pgvector to build without aggressive CPU-specific optimizations, which saves you from weird crashes when the build machine and the run machine have different CPU features. If you know your target CPU exactly you can drop it.
+
+Next, AGE. This is where I lost that afternoon. The AGE repo has tags like `PG16/v1.5.0` and branches like `release/PG16/1.5.0` and they are not the same thing. If you pick the wrong one you get "Remote branch not found in upstream origin" and you start questioning your life choices. The branch we want is `release/PG16/1.5.0`. Write that down. I spent an hour the first time staring at the screen convinced the docs were lying to me. They weren't. I was just reading them wrong.
+
+The second-to-last line appends `shared_preload_libraries = 'age'` to the postgres config template. Without this you'd have to run `LOAD 'age';` at the start of every session, which is the kind of thing you'll forget exactly once before it ruins your week. Preloading means AGE is there the moment Postgres starts.
+
+Last line copies our init scripts into the magic directory.
+
+## The init SQL scripts
+
+Postgres's official Docker image has a nice feature: any `.sql` or `.sh` file dropped into `/docker-entrypoint-initdb.d/` runs the first time Postgres starts with a fresh data volume. First time only. It's perfect for one-time setup that shouldn't run on every container restart.
+
+We've got three files. Here's the first, `01-extensions.sql`:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS age;
+ALTER DATABASE graphrag SET search_path = ag_catalog, "$user", public;
+```
+
+Two CREATE EXTENSIONs, one search_path change. That last line matters more than it looks. AGE defines a custom type called `agtype` (think JSON with graph semantics) and it lives in the `ag_catalog` schema. If `ag_catalog` isn't in your search_path, every Cypher query you write is going to fail to resolve the return types and you'll get confusing errors about unknown types. Setting it at the database level means every new connection gets it automatically.
+
+Second file, `02-schema.sql`, creates the documents table that pgvector will live in:
+
+```sql
+CREATE TABLE documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    doc_type TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    project_id TEXT,
+    dataset TEXT NOT NULL DEFAULT 'acme',
+    created_at TIMESTAMP DEFAULT NOW(),
+    embedding vector(384)
+);
+
+CREATE INDEX idx_documents_embedding ON documents
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+CREATE INDEX idx_documents_author ON documents (author_id);
+CREATE INDEX idx_documents_project ON documents (project_id);
+CREATE INDEX idx_documents_doc_type ON documents (doc_type);
+CREATE INDEX idx_documents_dataset ON documents (dataset);
+```
+
+The `vector(384)` column holds 384-dimensional embeddings (the default size for the sentence-transformers `all-MiniLM-L6-v2` model, which we'll use in Part 3). The HNSW index is pgvector's graph-based approximate nearest neighbor index. The parameters `m = 16` and `ef_construction = 200` are reasonable defaults for datasets up to about 1 million rows. Bigger datasets want bigger numbers, smaller ones can get away with less. Don't overthink this until you have enough data to measure.
+
+Third file, `03-graph-schema.sql`, sets up the AGE graph and its labels:
 
 ```sql
 SELECT ag_catalog.create_graph('org_graph');
@@ -26,196 +124,170 @@ SELECT ag_catalog.create_elabel('org_graph', 'OWNS');
 SELECT ag_catalog.create_elabel('org_graph', 'KNOWS_ABOUT');
 SELECT ag_catalog.create_elabel('org_graph', 'REPORTS_TO');
 SELECT ag_catalog.create_elabel('org_graph', 'AUTHORED');
+
+SELECT ag_catalog.create_vlabel('org_graph', 'Case');
+SELECT ag_catalog.create_vlabel('org_graph', 'Justice');
+SELECT ag_catalog.create_vlabel('org_graph', 'Issue');
+
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_MAJORITY');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_DISSENT');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_CONCURRING');
+SELECT ag_catalog.create_elabel('org_graph', 'WROTE_OPINION');
+SELECT ag_catalog.create_elabel('org_graph', 'CITED');
+SELECT ag_catalog.create_elabel('org_graph', 'CONCERNS');
 ```
 
-Five node types, seven edge types. That's it. People work on projects, belong to teams, know about technologies. Projects depend on services. People report to other people. And people author documents. If you can draw it on a napkin at a bar, you can model it in AGE.
+Here's a thing that trips up every Neo4j refugee: AGE makes you declare vertex labels (`create_vlabel`) and edge labels (`create_elabel`) before you can use them in a Cypher query. Neo4j just lets you conjure labels on the fly in a `CREATE` statement. AGE does not. If you try to `CREATE (:Person)` without first declaring Person as a vertex label, you get an error. It feels like paperwork, but it gives you strict schema enforcement and you adapt fast. The file above declares labels for two datasets in one graph: a generic org structure and the SCOTUS case dataset we'll wire up in Part 3.
 
-Now the bridge, which is the part most GraphRAG tutorials hand-wave past. The vector side lives in a normal Postgres table:
+## Docker Compose and first run
+
+Here's the compose file:
+
+```yaml
+services:
+  postgres:
+    build:
+      context: ./postgres
+    environment:
+      POSTGRES_DB: graphrag
+      POSTGRES_USER: graphrag
+      POSTGRES_PASSWORD: graphrag
+    ports:
+      - "5440:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphrag -d graphrag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: ./app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://graphrag:graphrag@postgres:5432/graphrag
+      LLM_PROVIDER: ${LLM_PROVIDER:-claude}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+
+volumes:
+  pgdata:
+```
+
+Two services. Postgres is the one we care about today. It builds from the Dockerfile we just walked through, persists data in a named volume (so you don't lose your graph when you restart), and exposes on port 5440 on the host. Why 5440 and not 5432? Because every developer I know already has something else listening on 5432, and the number of "why isn't my new Postgres starting" debugging sessions I've had would fill a small book. Pick a weird port, save yourself the grief.
+
+The `app` service is the FastAPI app we'll cover in Part 3. Ignore it for now. The healthcheck block on postgres means Compose will wait until Postgres is actually accepting connections before marking it healthy, which matters for the app service.
+
+Commands to bring it up and get a psql prompt:
+
+```bash
+git clone https://github.com/your-org/graphrag-demo.git
+cd graphrag-demo
+docker compose up -d postgres
+# Give it a few seconds to start and run the init scripts
+docker compose exec postgres psql -U graphrag -d graphrag
+```
+
+First build takes about 5 minutes while it compiles the extensions. After that, starts are near-instant.
+
+## Verify the extensions loaded
+
+Inside psql, run these. If the first one comes back with two rows, you're in business.
 
 ```sql
-CREATE TABLE documents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    doc_type TEXT NOT NULL CHECK (doc_type IN (
-        'meeting_note', 'architecture_doc', 'incident_report', 'decision_record'
-    )),
-    author_id TEXT NOT NULL,
-    project_id TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    embedding vector(384)
-);
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector', 'age');
 ```
 
-Notice `author_id` and `project_id`. Those are the glue. They're plain text columns in a relational table, but the values match the `id` property on Person and Project nodes over in the graph. No foreign keys. No triggers. Just a naming convention and a commitment to keep both sides in sync at write time. Think of it like the address on an envelope: the post office and the house don't share a schema, but if the address matches, the letter arrives.
+Expected output:
 
-Why no foreign key? Because AGE nodes aren't normal rows, and forcing referential integrity across the two worlds is the kind of elegant idea that eats your weekends. Been there. Bought the t-shirt. Still have the therapy bills.
-
-## Strategy 1: Vector-only, the baseline we already know
-
-You've seen this a hundred times, so I'm not going to linger. Embed the question, run a nearest-neighbor search, return the top K:
-
-```python
-with timed_stage(timing, "embedding"):
-    query_embedding = self.embedding_provider.embed(question)
-
-with timed_stage(timing, "vector_search"):
-    cur.execute(
-        """
-        SELECT title, content, doc_type,
-               1 - (embedding <=> %s::vector) AS similarity,
-               author_id, project_id
-        FROM documents
-        ORDER BY embedding <=> %s::vector
-        LIMIT %s
-        """,
-        (str(query_embedding), str(query_embedding), top_k),
-    )
+```
+ extname | extversion
+---------+------------
+ vector  | 0.8.0
+ age     | 1.5.0
 ```
 
-The `<=>` operator is pgvector's cosine distance. HNSW index does the heavy lifting. It's fast, it's standard, it's the starting line. This is the thing every RAG tutorial on the internet teaches, and for questions like "what did we decide about the billing migration" it actually works great. For questions like "who should I talk to about the payment service," it hands you three nicely-ranked architecture docs and zero humans. That's the problem.
+And confirm AGE knows about our graph:
 
-## Strategy 2: Graph-only, or how to get nothing when nothing matches
-
-Graph retrieval is a different animal. Instead of embedding the question, we try to find named entities in it, then traverse out from those entities to find related documents. Step one is loading what we know:
-
-```python
-for label, key in [
-    ("Person", "people"),
-    ("Project", "projects"),
-    ("Service", "services"),
-    ("Team", "teams"),
-    ("Technology", "technologies"),
-]:
-    cur.execute(
-        f"SELECT * FROM cypher('org_graph', $$ MATCH (n:{label}) RETURN n.id, n.name $$) "
-        f"AS (id agtype, name agtype);"
-    )
+```sql
+SELECT * FROM ag_catalog.ag_graph;
 ```
 
-That `cypher(...)` call is AGE's party trick. You write real Cypher inside a SQL query, and AGE coerces the result into Postgres rows through that `agtype` cast. It's weird the first time you see it, then you get used to it, then you start wishing every database did this.
+You'll see one row for `org_graph` with its namespace info. If either of these comes back empty, something went wrong in the init scripts. The most common cause is that the data volume already existed from a previous run. Init scripts only run on a fresh volume. If you need to start over, `docker compose down -v` will delete the volume and the next `up` will re-run everything.
 
-Entity extraction itself is embarrassingly simple. Lowercase the question, check if any known name is a substring. No fancy NER, no LLM call, no third model. If someone asks about "Sarah" and we have a Sarah in the graph, we match her:
+## Your first vector query
 
-```python
-for category, label in label_map.items():
-    for name, entity_id in known_entities[category].items():
-        if name in q_lower:
-            matches.append((label, entity_id))
+Let's put some rows into the documents table and run a similarity search. We'll use fake embeddings so you don't need a model running yet. They won't return meaningful semantic matches, but they'll prove the plumbing works:
+
+```sql
+INSERT INTO documents (title, content, doc_type, author_id, embedding)
+VALUES
+  ('Test A', 'quick brown fox',        'meeting_note', 'p-alice', array_fill(0.1::real, ARRAY[384])::vector),
+  ('Test B', 'lazy dog sleeps',        'meeting_note', 'p-bob',   array_fill(0.2::real, ARRAY[384])::vector),
+  ('Test C', 'Sphinx of black quartz', 'meeting_note', 'p-carol', array_fill(0.3::real, ARRAY[384])::vector);
+
+SELECT title, 1 - (embedding <=> array_fill(0.15::real, ARRAY[384])::vector) AS similarity
+FROM documents
+ORDER BY embedding <=> array_fill(0.15::real, ARRAY[384])::vector
+LIMIT 3;
 ```
 
-Is this the state of the art? No. Could you swap in a proper extractor? Absolutely. But for the demo it does the job, and the point here is to show the pattern, not to win a Kaggle competition. (If you're building this for production, please use something better than `in`. I'm begging you.)
+The `<=>` operator is pgvector's cosine distance. Lower means closer. Since a lot of people think in terms of similarity (higher is better), the convention is `1 - distance` to flip it into a 0-to-1 similarity score. The query above returns the three rows ordered by closeness to our query vector of all 0.15s, and Test A (all 0.1s) should come out closest.
 
-Once we have matches, we traverse. One hop, then two:
+Real embeddings come from a model. Sentence-transformers running locally, OpenAI's text-embedding-3 line, Cohere, whatever you like. They all produce a float vector of fixed dimension that you stick in that `vector(384)` column. In Part 3 we'll swap in a real local model so the similarity scores actually mean something.
 
-```python
-cur.execute(
-    f"SELECT * FROM cypher('org_graph', $$ "
-    f"MATCH (n:{label} {{id: '{entity_id}'}})-[r]->(m) "
-    f"RETURN labels(m), m.id, m.name, type(r) "
-    f"$$) AS (labels agtype, id agtype, name agtype, rel_type agtype);"
-)
+## Your first Cypher query
+
+This is the section most Postgres people have been waiting for, because Cypher is probably brand new. Let's create some nodes and an edge:
+
+```sql
+SELECT * FROM cypher('org_graph', $$
+  CREATE (alice:Person {name: 'Alice', title: 'Engineer'})
+  CREATE (bob:Person {name: 'Bob', title: 'Engineer'})
+  CREATE (eng:Team {name: 'Engineering'})
+  CREATE (alice)-[:MEMBER_OF]->(eng)
+  CREATE (bob)-[:MEMBER_OF]->(eng)
+  RETURN alice.name, bob.name
+$$) AS (alice agtype, bob agtype);
 ```
 
-Then we collect every Person and Project ID we touched, and we ask the documents table: give me everything authored by these people or belonging to these projects. That's the join point where the graph world hands its results back to the relational world.
+Stare at that wrapper for a second because you're going to type it a hundred times. AGE embeds Cypher inside SQL through the `cypher()` function. First argument is the graph name. Second argument is a dollar-quoted string (`$$ ... $$`) containing the actual Cypher. And because Postgres is strict about types, you have to tell it what columns come back, always as `agtype`. So the `AS (alice agtype, bob agtype)` clause at the end maps the Cypher RETURN values to named SQL columns. Miss the AS clause, or get the number of columns wrong, and you get an error.
 
-The catch? If the question doesn't mention any known entity, graph retrieval returns an empty list. Zero results. A wall. This is a feature, not a bug, because it tells you honestly when it can't help. But it's also why graph-only is a lousy default strategy. Half your user questions are going to be phrased in ways that don't contain a single proper noun, and you can't serve those with a traversal. Which brings us to the star of the show.
+Inside the Cypher itself, `(alice:Person {name: 'Alice'})` is a node pattern: variable `alice`, label `Person`, properties as JSON-ish. Arrows like `-[:MEMBER_OF]->` are directed edges with a type. The whole syntax was designed to look like ASCII art of a graph, and once you get past the initial weirdness it reads really nicely.
 
-## Strategy 3: Graph plus vector, the combined approach
+Now let's query what we just wrote:
 
-Combined retrieval runs in three stages, and each one does what it's good at:
-
-1. **Seed.** Vector search finds semantically relevant documents. No entity matching needed, so even vague questions get a foothold.
-2. **Expand.** For each seed result, we look up its author and project in the graph, then traverse one or two hops to find colleagues on the same team and projects sharing dependencies.
-3. **Rerank.** We merge the vector results and the graph-expanded results, deduplicate by title, and produce a weighted score that respects both signals.
-
-Stage one is just the vector retrieval we already built, called verbatim. The interesting code is in stage two. For each seed document, we pull its `author_id` and `project_id`, then ask the graph two questions:
-
-```python
-cur.execute(
-    "SELECT * FROM cypher('org_graph', $$ "
-    f"MATCH (p:Person {{id: '{author_id}'}})-[:MEMBER_OF]->(t:Team)<-[:MEMBER_OF]-(colleague:Person) "
-    "WHERE colleague <> p "
-    "RETURN colleague.id "
-    "$$) AS (id agtype);"
-)
+```sql
+SELECT * FROM cypher('org_graph', $$
+  MATCH (p:Person)-[:MEMBER_OF]->(t:Team {name: 'Engineering'})
+  RETURN p.name, p.title
+$$) AS (name agtype, title agtype);
 ```
 
-Question one: who are this author's teammates? Question two (if the seed doc has a project):
+`MATCH` is the pattern match verb: "find me every Person that has a MEMBER_OF edge to a Team named Engineering, and return the person's name and title." You'll get Alice and Bob back. Heads up: the values come back with quotes around them, like `"Alice"` instead of `Alice`, because they're `agtype` (basically a JSON scalar) not plain text. In application code you'll either cast them or strip the quotes. Annoying the first time, muscle memory the second time.
 
-```python
-cur.execute(
-    "SELECT * FROM cypher('org_graph', $$ "
-    f"MATCH (p:Project {{id: '{project_id}'}})-[:DEPENDS_ON]->(s:Service)<-[:DEPENDS_ON]-(p2:Project) "
-    "WHERE p2 <> p "
-    "RETURN p2.id "
-    "$$) AS (id agtype);"
-)
-```
+A handful of gotchas to save you pain:
 
-Which other projects share dependencies with this one? Then we fetch documents authored by those colleagues or belonging to those neighboring projects. This is the magic. A vector match on "payment service outage" brings back one incident report. Graph expansion pulls in the rest of the team who handled it, the adjacent services that depend on payments, and the architecture docs those other services produced. You go from one document to a little neighborhood of context without ever asking the LLM to be clever.
+- Labels must exist before use. If you forgot a label in `03-graph-schema.sql`, add a `create_vlabel` call and re-run it. Labels are cheap.
+- `agtype` is not `text`. Cast with `::text` and strip quotes, or use AGE's helper functions.
+- `ag_catalog` must be in your search_path. We set this at the database level in `01-extensions.sql`, but if you create a new user or database you'll need to set it again.
 
-Stage three is where we clean up. The rerank function deduplicates by title (because vector and graph will often surface the same doc) and applies different weights depending on where each hit came from:
+## The "so what" moment
 
-```python
-for item in best_by_title.values():
-    if item.source == "vector":
-        combined_score = item.score * vector_weight
-    elif item.source == "graph_expanded":
-        combined_score = item.score * graph_weight
-    else:
-        combined_score = item.score
-```
+Step back for a second. You now have a single Postgres instance with pgvector storing embeddings and Apache AGE storing graph nodes and edges. You can write a SQL query that does vector similarity search. You can write a Cypher query that does multi-hop graph traversal. And because they're in the same database, you can join between them in a single statement. No two-database sync problem. No dual-writes. No eventual consistency headaches between your vector store and your graph store. One Postgres, one connection pool, one transaction boundary.
 
-Default weights are 0.6 for vector and 0.4 for graph. Why those numbers? Because they worked in testing. That's it. That's the whole justification. You will absolutely want to tune these for your own data, and anyone who tells you there's a universal right answer is selling a vector database. The point of the weights isn't precision, it's intent: you're telling the system "semantic match is the main signal, structural proximity is the tiebreaker." Flip those weights and the behavior changes in interesting ways. Try it.
+That's the foundation. Everything interesting we're going to build in Part 3 rides on top of this setup. If yours is running and the verification queries came back clean, you're ready.
 
-The reason this beats either strategy alone comes down to failure modes. Vector search fails when the question is structural (who, which team, what depends on what). Graph search fails when the question is semantic (what did we decide, what happened, how does this work). Combined search fails only when both fail, which in practice is rare, because almost every real question has at least one foothold in one world or the other.
+## Part 3 preview
 
-## The LLM layer (it's honestly not the star)
+In Part 3, we take this same stack and point it at 391 real Supreme Court cases with justice voting patterns, majority and dissent opinions, and a citation graph you can actually walk. You're going to see multi-hop Cypher queries that no hybrid search can match, and you're going to see exactly where each retrieval approach wins and loses on real data. It's the good stuff. Grab a coffee.
 
-The LLM interface is deliberately dumb:
-
-```python
-class LLMProvider(Protocol):
-    def generate(self, prompt: str, context: list[str]) -> str: ...
-
-
-def get_llm_provider(provider_name: str) -> LLMProvider:
-    if provider_name == "claude":
-        from llm.claude_llm import ClaudeLLMProvider
-        return ClaudeLLMProvider()
-    elif provider_name == "openai":
-        from llm.openai_llm import OpenAILLMProvider
-        return OpenAILLMProvider()
-    elif provider_name == "ollama":
-        from llm.ollama_llm import OllamaLLMProvider
-        return OllamaLLMProvider()
-```
-
-Three providers. One environment variable to switch. Claude, OpenAI, or a local Ollama model running on your laptop. I don't care which one you use, and you probably shouldn't either. This is my hill to die on in AI Land: the hard problem is always data engineering, not model selection. Embedding models, chunking strategies, and search filtering will move your quality needle ten times further than arguing about whether Claude or GPT is smarter this week. The LLM takes whatever context you hand it and generates a response. If the context is good, the answer is good. If the context is garbage, no model will save you. (I've watched teams spend six weeks comparing frontier models when their retrieval was returning the wrong documents. Don't be that team.)
-
-## The orchestrator (run them all, time them all)
-
-To make the comparison fair, the FastAPI handler runs all three strategies in parallel using asyncio plus a thread pool:
-
-```python
-vector_future = loop.run_in_executor(
-    _executor, _run_strategy, "vector", request.question, request.top_k
-)
-graph_future = loop.run_in_executor(
-    _executor, _run_strategy, "graph", request.question, request.top_k
-)
-combined_future = loop.run_in_executor(
-    _executor, _run_strategy, "graph+vector", request.question, request.top_k
-)
-
-results = await asyncio.gather(vector_future, graph_future, combined_future)
-```
-
-Each strategy gets its own timing object that captures every stage: embedding, vector search, entity extraction, graph traversal, graph expansion, reranking, LLM generation. Every millisecond gets a label. Parallel execution matters because we want apples-to-apples comparisons across strategies, not "the first one ran while the database was cold." We'll spend all of Part 3 staring at these numbers.
-
-## What's next
-
-We've got three retrieval strategies, one database, and a FastAPI endpoint that fires them off in parallel and times every stage. Part 3 is the showdown. We'll put all three head-to-head on real questions, look at where each one wins and where each one faceplants, and stare at the timing data until we have receipts. Spoiler: it gets interesting, and not always in the direction I expected.
-
-Now the question for you. Before you read Part 3, take a guess: on an org-knowledge corpus like this one, how much slower is combined retrieval than vector-only? And does the answer change your mind about whether it's worth building? Write your guess down. I'll tell you if you were right next post.
+While you're waiting, here's a challenge: go back to the psql prompt and add a third team (call it Product or whatever you like), create a new Person on that team, and then add a `WORKS_ON` edge from one of the existing engineers to a Project node that the Product team `OWNS`. Then write a Cypher query that finds every Person who works on a project owned by a team they're not a member of. The second time you write Cypher it stops feeling foreign. The fifth time, you'll start wondering why more databases don't have it built in.
