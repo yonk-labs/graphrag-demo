@@ -17,7 +17,7 @@ def test_health_endpoint():
     assert response.json() == {"status": "ok"}
 
 
-def test_query_endpoint_returns_three_strategies():
+def test_query_endpoint_returns_four_strategies():
     mock_results = []
     mock_timing_dict = {"embedding": 5.0, "vector_search": 10.0, "total": 15.0}
 
@@ -34,7 +34,7 @@ def test_query_endpoint_returns_three_strategies():
     assert response.status_code == 200
     data = response.json()
     assert data["question"] == "test question"
-    assert len(data["strategies"]) == 3
+    assert len(data["strategies"]) == 4
 
 
 def test_query_endpoint_rejects_empty_question():

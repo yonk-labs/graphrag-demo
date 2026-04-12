@@ -24,7 +24,7 @@ def test_rerank_results_combines_scores():
 
     reranked = rerank_results(items, vector_weight=0.6, graph_weight=0.4)
     assert len(reranked) == 3
-    assert all(r.source == "graph+vector" for r in reranked)
+    assert all(r.source == "graph+vector+hybrid" for r in reranked)
 
 
 def test_rerank_deduplicates_by_title():

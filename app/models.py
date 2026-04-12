@@ -20,6 +20,7 @@ class StrategyResult(BaseModel):
     results: list[RetrievedItem]
     answer: str
     timing: dict[str, float]
+    metadata: dict | None = None
 
 
 class QueryResponse(BaseModel):

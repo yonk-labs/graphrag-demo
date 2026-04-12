@@ -17,53 +17,55 @@ from embeddings import get_embedding_provider
 from llm import get_llm_provider
 from retrieval.vector import VectorRetrieval
 from retrieval.graph import GraphRetrieval
+from retrieval.hybrid import HybridRetrieval
 from retrieval.combined import CombinedRetrieval
+from retrieval.production import ProductionRetrieval
 from seed.seed import main as run_seed
 
-_executor = ThreadPoolExecutor(max_workers=6)
+_executor = ThreadPoolExecutor(max_workers=8)
 _embedding_provider = None
 _llm_provider = None
 _vector_retrieval = None
 _graph_retrieval = None
+_hybrid_retrieval = None
 _combined_retrieval = None
+_production_retrieval = None
 
 
 EXAMPLE_QUERIES = [
-    # ACME
     {
         "question": "What was decided about the billing migration?",
-        "description": "Vector excels: finds the decision doc by semantic match",
+        "description": "Stage 1+2 sufficient (semantic lookup, no graph expand)",
         "dataset": "acme",
     },
     {
         "question": "Who should I talk to about the payment service?",
-        "description": "Graph excels: finds the ownership chain",
+        "description": "Stage 3 triggers (graph-shaped 'who' pattern)",
         "dataset": "acme",
     },
     {
         "question": "What's the blast radius if the auth service goes down?",
-        "description": "Combined wins: dependency chain + related incidents + responsible people",
+        "description": "Stage 3 triggers (dependency chain)",
         "dataset": "acme",
     },
-    # SCOTUS
     {
-        "question": "Which justices voted with Sotomayor on First Amendment cases?",
-        "description": "Graph wins: voting relationships aren't in opinion text",
+        "question": "Find cases about administrative overreach",
+        "description": "Stage 1+2 sufficient (semantic topical search)",
         "dataset": "scotus",
     },
     {
-        "question": "Find cases about antitrust and market power",
-        "description": "Vector wins: semantic topical search across case summaries",
+        "question": "Which cases did Justice Thomas and Justice Sotomayor vote on together?",
+        "description": "Stage 3 triggers (multi-entity multi-hop)",
         "dataset": "scotus",
     },
     {
-        "question": "What cases did Justice Thomas dissent on?",
-        "description": "Graph wins: dissent relationships via VOTED_DISSENT edges",
+        "question": "What First Amendment cases did Justice Sotomayor vote on?",
+        "description": "Stage 3 triggers (justice + issue intersection)",
         "dataset": "scotus",
     },
     {
-        "question": "Show me cases about environmental law that Justice Kagan wrote the majority for",
-        "description": "Combined wins: issue topic (vector) + authorship (graph)",
+        "question": "Find cases with docket number 17-204",
+        "description": "Stage 1+2 sufficient (exact keyword match via BM25)",
         "dataset": "scotus",
     },
 ]
@@ -72,7 +74,7 @@ EXAMPLE_QUERIES = [
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _embedding_provider, _llm_provider
-    global _vector_retrieval, _graph_retrieval, _combined_retrieval
+    global _vector_retrieval, _graph_retrieval, _hybrid_retrieval, _combined_retrieval, _production_retrieval
 
     init_pool()
 
@@ -86,8 +88,14 @@ async def lifespan(app: FastAPI):
     _llm_provider = get_llm_provider(settings.llm_provider)
     _vector_retrieval = VectorRetrieval(_embedding_provider)
     _graph_retrieval = GraphRetrieval()
+    _hybrid_retrieval = HybridRetrieval(_embedding_provider)
     _combined_retrieval = CombinedRetrieval(
         vector_retrieval=VectorRetrieval(_embedding_provider),
+        graph_retrieval=GraphRetrieval(),
+        hybrid_retrieval=HybridRetrieval(_embedding_provider),
+    )
+    _production_retrieval = ProductionRetrieval(
+        hybrid_retrieval=HybridRetrieval(_embedding_provider),
         graph_retrieval=GraphRetrieval(),
     )
     yield
@@ -102,15 +110,18 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 def _run_strategy(name: str, question: str, top_k: int) -> dict:
     """Run a retrieval strategy and generate an LLM answer. Runs in thread pool."""
     timing = TimingResult()
+    production_metadata = None
 
     if name == "vector":
         results = _vector_retrieval.retrieve(question, top_k, timing)
+    elif name == "hybrid":
+        results = _hybrid_retrieval.retrieve(question, top_k, timing)
     elif name == "graph":
         results = _graph_retrieval.retrieve(question, top_k, timing)
-    elif name == "graph+vector":
-        results = _combined_retrieval.retrieve(question, top_k, timing)
+    elif name == "production":
+        results, production_metadata = _production_retrieval.retrieve(question, top_k, timing)
     else:
-        return {"strategy": name, "results": [], "answer": "Unknown strategy", "timing": {}}
+        return {"strategy": name, "results": [], "answer": "Unknown strategy", "timing": {}, "metadata": None}
 
     # Generate LLM answer from retrieved context
     from timing import timed_stage
@@ -133,6 +144,7 @@ def _run_strategy(name: str, question: str, top_k: int) -> dict:
         "results": [r.model_dump() for r in results],
         "answer": answer,
         "timing": timing.to_dict(),
+        "metadata": production_metadata if name == "production" else None,
     }
 
 
@@ -148,18 +160,21 @@ async def query(request: QueryRequest):
 
     loop = asyncio.get_event_loop()
 
-    # Run all three strategies in parallel
+    # Run all four strategies in parallel
     vector_future = loop.run_in_executor(
         _executor, _run_strategy, "vector", request.question, request.top_k
+    )
+    hybrid_future = loop.run_in_executor(
+        _executor, _run_strategy, "hybrid", request.question, request.top_k
     )
     graph_future = loop.run_in_executor(
         _executor, _run_strategy, "graph", request.question, request.top_k
     )
-    combined_future = loop.run_in_executor(
-        _executor, _run_strategy, "graph+vector", request.question, request.top_k
+    production_future = loop.run_in_executor(
+        _executor, _run_strategy, "production", request.question, request.top_k
     )
 
-    results = await asyncio.gather(vector_future, graph_future, combined_future)
+    results = await asyncio.gather(vector_future, hybrid_future, graph_future, production_future)
 
     return QueryResponse(
         question=request.question,

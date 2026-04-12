@@ -1,21 +1,33 @@
 const STAGE_COLORS = {
     embedding: "#f59e0b",
     vector_search: "#3b82f6",
+    fulltext_search: "#ec4899",
+    rrf_fusion: "#f472b6",
     entity_extraction: "#8b5cf6",
     graph_traversal: "#6366f1",
+    graph_entity_search: "#818cf8",
+    hybrid_search: "#ec4899",
     graph_expansion: "#10b981",
-    reranking: "#ec4899",
-    llm_generation: "#ef4444",
+    reranking: "#ef4444",
+    llm_generation: "#6b7280",
+    stage2_graph_boost: "#10b981",
+    stage3_graph_expand: "#8b5cf6",
 };
 
 const STAGE_LABELS = {
     embedding: "Embed",
     vector_search: "Vector Search",
+    fulltext_search: "Full-text",
+    rrf_fusion: "RRF Fusion",
     entity_extraction: "Entity Extract",
     graph_traversal: "Graph Traverse",
+    graph_entity_search: "Graph Entity",
+    hybrid_search: "Hybrid",
     graph_expansion: "Graph Expand",
     reranking: "Re-rank",
     llm_generation: "LLM",
+    stage2_graph_boost: "S2: Graph Boost",
+    stage3_graph_expand: "S3: Graph Expand",
 };
 
 document.addEventListener("DOMContentLoaded", loadExamples);
@@ -82,6 +94,21 @@ function renderResults(data) {
         renderTiming(strategy.strategy, strategy.timing);
         renderAnswer(strategy.strategy, strategy.answer);
         renderResultsList(strategy.strategy, strategy.results);
+
+        if (strategy.strategy === "production" && strategy.metadata) {
+            const m = strategy.metadata;
+            const stage3Status = m.stage3_triggered ? "&#10003; triggered" : "&#10007; skipped";
+            const stageIndicator = '<div class="stage-indicator">' +
+                '<div><span class="stage">S1 Hybrid &#10003;</span>' +
+                '<span class="stage">S2 Boost &#10003;</span>' +
+                '<span class="stage">S3 Expand ' + stage3Status + '</span></div>' +
+                '<div class="stage-reason">' + escapeHtml(m.trigger_reason || "") + '</div>' +
+                '</div>';
+            const timingContainer = document.getElementById("timing-production");
+            if (timingContainer) {
+                timingContainer.insertAdjacentHTML("beforeend", stageIndicator);
+            }
+        }
     });
 
     document.getElementById("results").classList.remove("hidden");

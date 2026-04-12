@@ -9,22 +9,20 @@ from retrieval.graph import GraphRetrieval
 
 def rerank_results(
     items: list[RetrievedItem],
-    vector_weight: float = 0.6,
+    vector_weight: float = 0.4,
     graph_weight: float = 0.4,
+    hybrid_weight: float = 0.2,
 ) -> list[RetrievedItem]:
     """
-    Re-rank results by combining vector similarity and graph proximity.
+    Re-rank results by combining vector similarity, graph proximity, and hybrid (RRF) scores.
     Deduplicates by title, keeping the highest-scoring version.
     """
-    # Deduplicate: keep best score per title, but prefer complementary sources
-    # (so a doc found by BOTH vector and graph keeps the higher-weighted score)
     best_by_title: dict[str, RetrievedItem] = {}
     for item in items:
         existing = best_by_title.get(item.title)
         if existing is None or item.score > existing.score:
             best_by_title[item.title] = item
 
-    # Re-score based on source
     reranked = []
     for item in best_by_title.values():
         if item.source == "vector":
@@ -33,6 +31,9 @@ def rerank_results(
             combined_score = item.score * graph_weight
         elif item.source == "graph_expanded":
             combined_score = item.score * graph_weight * 0.7
+        elif item.source == "hybrid":
+            # RRF scores are tiny (~0.01-0.03), boost them to be comparable
+            combined_score = item.score * hybrid_weight * 10
         else:
             combined_score = item.score
 
@@ -41,7 +42,7 @@ def rerank_results(
             content=item.content,
             doc_type=item.doc_type,
             score=round(combined_score, 4),
-            source="graph+vector",
+            source="graph+vector+hybrid",
             explanation=f"Combined: {item.explanation}",
         ))
 
@@ -178,10 +179,12 @@ class CombinedRetrieval:
         self,
         vector_retrieval: VectorRetrieval,
         graph_retrieval: GraphRetrieval | None = None,
+        hybrid_retrieval=None,
         graph_expand_fn: Callable | None = None,
     ):
         self.vector_retrieval = vector_retrieval
         self.graph_retrieval = graph_retrieval
+        self.hybrid_retrieval = hybrid_retrieval
         self.graph_expand_fn = graph_expand_fn or _default_graph_expand
 
     def retrieve(
@@ -202,13 +205,29 @@ class CombinedRetrieval:
                 except Exception:
                     graph_results = []
 
+        # Stage 3b: Hybrid search (vector + BM25 fusion seeds)
+        hybrid_results: list[RetrievedItem] = []
+        with timed_stage(timing, "hybrid_search"):
+            if self.hybrid_retrieval is not None:
+                try:
+                    sub_timing = TimingResult()
+                    hybrid_results = self.hybrid_retrieval.retrieve(
+                        question, top_k=top_k, timing=sub_timing
+                    )
+                except Exception:
+                    hybrid_results = []
+
         # Stage 4: Graph expansion from vector seed results
         graph_expanded: list[RetrievedItem] = []
         with timed_stage(timing, "graph_expansion"):
             if vector_results:
                 try:
                     with get_connection() as conn:
-                        seen_titles = {r.title for r in vector_results} | {r.title for r in graph_results}
+                        seen_titles = (
+                            {r.title for r in vector_results}
+                            | {r.title for r in graph_results}
+                            | {r.title for r in hybrid_results}
+                        )
                         for vr in vector_results[:5]:
                             with conn.cursor() as cur:
                                 cur.execute(
@@ -229,7 +248,7 @@ class CombinedRetrieval:
 
         # Stage 5: Re-rank combined results
         with timed_stage(timing, "reranking"):
-            all_results = vector_results + graph_results + graph_expanded
+            all_results = vector_results + graph_results + hybrid_results + graph_expanded
             reranked = rerank_results(all_results)
 
         return reranked[:top_k]
