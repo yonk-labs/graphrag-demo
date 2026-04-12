@@ -1,10 +1,13 @@
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 from config import settings
 from db import init_pool, close_pool
@@ -26,21 +29,42 @@ _combined_retrieval = None
 
 
 EXAMPLE_QUERIES = [
+    # ACME
     {
         "question": "What was decided about the billing migration?",
         "description": "Vector excels: finds the decision doc by semantic match",
+        "dataset": "acme",
     },
     {
         "question": "Who should I talk to about the payment service?",
         "description": "Graph excels: finds the ownership chain",
+        "dataset": "acme",
     },
     {
         "question": "What's the blast radius if the auth service goes down?",
         "description": "Combined wins: dependency chain + related incidents + responsible people",
+        "dataset": "acme",
+    },
+    # SCOTUS
+    {
+        "question": "Which justices voted with Sotomayor on First Amendment cases?",
+        "description": "Graph wins: voting relationships aren't in opinion text",
+        "dataset": "scotus",
     },
     {
-        "question": "Catch me up on what the data team has been working on",
-        "description": "Combined wins: team projects + recent docs + cross-team impacts",
+        "question": "Find cases about antitrust and market power",
+        "description": "Vector wins: semantic topical search across case summaries",
+        "dataset": "scotus",
+    },
+    {
+        "question": "What cases did Justice Thomas dissent on?",
+        "description": "Graph wins: dissent relationships via VOTED_DISSENT edges",
+        "dataset": "scotus",
+    },
+    {
+        "question": "Show me cases about environmental law that Justice Kagan wrote the majority for",
+        "description": "Combined wins: issue topic (vector) + authorship (graph)",
+        "dataset": "scotus",
     },
 ]
 
@@ -72,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GraphRAG Demo", lifespan=lifespan)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _run_strategy(name: str, question: str, top_k: int) -> dict:
@@ -114,7 +138,7 @@ def _run_strategy(name: str, question: str, top_k: int) -> dict:
 
 @app.get("/")
 def root():
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 @app.post("/api/query")

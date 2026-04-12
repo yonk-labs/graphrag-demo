@@ -12,7 +12,10 @@ def _load_known_entities(cur) -> dict:
     if _known_entities is not None:
         return _known_entities
 
-    entities = {"people": {}, "projects": {}, "services": {}, "teams": {}, "technologies": {}}
+    entities = {
+        "people": {}, "projects": {}, "services": {}, "teams": {}, "technologies": {},
+        "cases": {}, "justices": {}, "issues": {},
+    }
 
     for label, key in [
         ("Person", "people"),
@@ -20,6 +23,9 @@ def _load_known_entities(cur) -> dict:
         ("Service", "services"),
         ("Team", "teams"),
         ("Technology", "technologies"),
+        ("Case", "cases"),
+        ("Justice", "justices"),
+        ("Issue", "issues"),
     ]:
         cur.execute(
             f"SELECT * FROM cypher('org_graph', $$ MATCH (n:{label}) RETURN n.id, n.name $$) "
@@ -49,12 +55,23 @@ def extract_entities(question: str, known_entities: dict) -> list[tuple[str, str
         "services": "Service",
         "teams": "Team",
         "technologies": "Technology",
+        "cases": "Case",
+        "justices": "Justice",
+        "issues": "Issue",
     }
 
     for category, label in label_map.items():
-        for name, entity_id in known_entities[category].items():
+        for name, entity_id in known_entities.get(category, {}).items():
             if name in q_lower:
                 matches.append((label, entity_id))
+
+    # Secondary match: last-name-only for justices
+    for name, entity_id in known_entities.get("justices", {}).items():
+        parts = name.split()
+        if len(parts) > 1:
+            last_name = parts[-1].lower()
+            if last_name in q_lower and ("Justice", entity_id) not in matches:
+                matches.append(("Justice", entity_id))
 
     return matches
 
@@ -162,7 +179,7 @@ class GraphRetrieval:
                             entity_hops[eid] = hops
 
                     # Originally matched entities are hop 0 (treat as 1-hop for scoring)
-                    for label, eid in matched:
+                    for _label, eid in matched:
                         entity_hops[eid] = 0
 
                     all_entity_ids = list(entity_hops.keys())

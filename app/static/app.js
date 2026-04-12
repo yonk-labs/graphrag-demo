@@ -32,7 +32,8 @@ async function loadExamples() {
         examples.forEach(function(ex) {
             const btn = document.createElement("button");
             btn.className = "example-btn";
-            btn.textContent = ex.question;
+            const dataset = ex.dataset || "acme";
+            btn.innerHTML = '<span class="example-dataset dataset-' + dataset + '">' + dataset.toUpperCase() + '</span> ' + escapeHtml(ex.question);
             btn.title = ex.description;
             btn.onclick = function() {
                 document.getElementById("question-input").value = ex.question;

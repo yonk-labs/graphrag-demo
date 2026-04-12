@@ -324,3 +324,23 @@ header .subtitle {
         grid-template-columns: 1fr;
     }
 }
+
+.example-dataset {
+    display: inline-block;
+    padding: 0.05rem 0.35rem;
+    margin-right: 0.3rem;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+
+.dataset-acme {
+    background: #1e3a5c;
+    color: #58a6ff;
+}
+
+.dataset-scotus {
+    background: #4c1d95;
+    color: #c4b5fd;
+}

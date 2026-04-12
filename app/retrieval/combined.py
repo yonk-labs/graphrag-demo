@@ -49,10 +49,18 @@ def rerank_results(
     return reranked
 
 
-def _default_graph_expand(conn, author_id: str, project_id: str | None) -> list[RetrievedItem]:
+def _default_graph_expand(
+    conn, author_id: str, project_id: str | None, dataset: str = "acme"
+) -> list[RetrievedItem]:
     """Expand from a document's author/project into the graph, find related docs."""
+    if dataset == "scotus":
+        return _scotus_graph_expand(conn, author_id, project_id)
+    return _acme_graph_expand(conn, author_id, project_id)
+
+
+def _acme_graph_expand(conn, author_id: str, project_id: str | None) -> list[RetrievedItem]:
     results = []
-    entity_ids = [author_id]
+    entity_ids = [author_id] if author_id else []
     if project_id:
         entity_ids.append(project_id)
 
@@ -104,6 +112,67 @@ def _default_graph_expand(conn, author_id: str, project_id: str | None) -> list[
     return results
 
 
+def _scotus_graph_expand(conn, author_id: str, project_id: str | None) -> list[RetrievedItem]:
+    """Expand from a SCOTUS document: find citation chain, related cases via issues."""
+    results = []
+
+    with conn.cursor() as cur:
+        cited_case_ids = []
+        if project_id:
+            cur.execute(
+                "SELECT * FROM cypher('org_graph', $$ "
+                f"MATCH (c:Case {{id: '{project_id}'}})-[:CITED]->(c2:Case) "
+                "RETURN c2.id "
+                "$$) AS (id agtype);"
+            )
+            cited_case_ids = [str(row[0]).strip('"') for row in cur.fetchall()]
+
+        related_case_ids = []
+        if project_id:
+            cur.execute(
+                "SELECT * FROM cypher('org_graph', $$ "
+                f"MATCH (c:Case {{id: '{project_id}'}})-[:CONCERNS]->(i:Issue)<-[:CONCERNS]-(c2:Case) "
+                "WHERE c2 <> c "
+                "RETURN DISTINCT c2.id "
+                "$$) AS (id agtype);"
+            )
+            related_case_ids = [str(row[0]).strip('"') for row in cur.fetchall()]
+
+        justice_case_ids = []
+        if author_id:
+            cur.execute(
+                "SELECT * FROM cypher('org_graph', $$ "
+                f"MATCH (j:Justice {{id: '{author_id}'}})-[v:VOTED_MAJORITY|VOTED_DISSENT]->(c:Case) "
+                "RETURN c.id "
+                "$$) AS (id agtype);"
+            )
+            justice_case_ids = [str(row[0]).strip('"') for row in cur.fetchall()]
+
+        all_case_ids = list(set(cited_case_ids + related_case_ids + justice_case_ids))
+
+        if all_case_ids:
+            placeholders = ",".join(["%s"] * len(all_case_ids))
+            cur.execute(
+                f"SELECT title, content, doc_type, author_id, project_id "
+                f"FROM documents "
+                f"WHERE project_id IN ({placeholders}) AND dataset = 'scotus' "
+                f"LIMIT 30",
+                all_case_ids,
+            )
+            for row in cur.fetchall():
+                hop_count = 1 if (row[4] in cited_case_ids or row[4] in justice_case_ids) else 2
+                results.append(RetrievedItem(
+                    title=row[0],
+                    content=row[1],
+                    doc_type=row[2],
+                    score=1.0 / (1 + hop_count),
+                    source="graph_expanded",
+                    explanation=f"SCOTUS graph expansion: {hop_count} hop(s) from seed",
+                ))
+
+    return results
+
+
 class CombinedRetrieval:
     def __init__(
         self,
@@ -143,12 +212,14 @@ class CombinedRetrieval:
                         for vr in vector_results[:5]:
                             with conn.cursor() as cur:
                                 cur.execute(
-                                    "SELECT author_id, project_id FROM documents WHERE title = %s LIMIT 1",
+                                    "SELECT author_id, project_id, dataset FROM documents WHERE title = %s LIMIT 1",
                                     (vr.title,),
                                 )
                                 row = cur.fetchone()
                                 if row:
-                                    expanded = self.graph_expand_fn(conn, row[0], row[1])
+                                    expanded = self.graph_expand_fn(
+                                        conn, row[0], row[1], dataset=row[2]
+                                    )
                                     for item in expanded:
                                         if item.title not in seen_titles:
                                             graph_expanded.append(item)
