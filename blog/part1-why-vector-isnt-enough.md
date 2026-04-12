@@ -1,166 +1,71 @@
-# Why Vector Search Isn't Enough
+# Why Your RAG Pipeline Needs Graph AND Vector AND Hybrid Search
 
-Your RAG pipeline is returning technically correct, completely useless answers. Somebody on your team asks, "Who should I talk to about the payment service?" and gets back a two-year-old meeting note where Karen from marketing mentioned that her credit card was declined at lunch. Technically, that doc contains the word "payment." Technically, the retriever did its job. Practically, you just made it harder for a human to get their work done, and now they're back in Slack asking the same question the old-fashioned way.
+So you built a RAG pipeline. You stacked pgvector on top of Postgres, wired it to an embedding model, hooked it to your favorite LLM, and shipped it to a handful of real users. For a week you felt like a wizard. Then somebody asked, "who voted with Sotomayor on First Amendment cases last term?" and your shiny system coughed up three dissent paragraphs that don't actually name a single justice. Your users stopped asking clever questions and started asking, politely, whether the whole thing is broken.
 
-I've been doing databases for about 20 years, and I've watched this exact failure mode show up in every single production RAG system I've poked at in the last eighteen months. It's not a bug. It's not a bad embedding model. It's not even a chunking problem (though your chunking is probably also bad, sorry). It's that vector search is answering a fundamentally different question than the one your users are asking. And until we get honest about that, we're going to keep shipping demos that look great on stage and fall over the first time someone tries to use them for real work.
+I've built this exact broken thing. More than once. (I'm not proud of it, but pretending otherwise would be a bad look for someone who's been working on databases for 20+ years.) The reason it keeps happening isn't that vector search is bad. Vector search is great at what it does. The problem is that your users don't ask one kind of question. They ask three. And if you only built for one, two out of three queries are going to make you look silly.
 
-## The problem with vector-only RAG
+## Three kinds of questions, three kinds of retrieval
 
-Here's the deal. Vector search finds text that sounds like your question. That's it. That's the whole trick. You embed the question, you embed a pile of documents, you cosine-similarity your way to the top K. It's elegant, it's fast, it's genuinely useful for a lot of things. Summarizing a long doc? Great. Finding that one blog post you half-remember reading? Great. Pulling the relevant paragraph out of a 400-page PDF? Also great.
+Here's the deal. Every production RAG system I've looked at eventually runs into the same split. Users ask semantic questions, they ask keyword questions, and they ask relationship questions. Those aren't marketing buckets I made up on a whiteboard. They're the three shapes real queries take, and each shape needs a different retrieval technique to answer it well.
 
-But organizations have structure that isn't written down anywhere in document text. Who reports to whom. Which team owns which service. Which project depends on which other project. Who knows the history of that one weird Kafka cluster that nobody wants to touch. That stuff lives in org charts, in service catalogs, in people's heads, and occasionally in a Confluence page that hasn't been updated since 2022. It does not live in the text of meeting notes in a way a cosine similarity score can find.
+**Kind 1: "Find me something like this."** The user has a vibe, a topic, a concept. They don't know the exact words in the document, and they don't care. "What cases deal with administrative overreach?" is a semantic question. The phrase "administrative overreach" might not appear anywhere in the actual ruling, but the concept does. This is exactly what vector search was built for. You embed the query, you embed the documents, you run a cosine similarity lookup, and pgvector hands you back the top matches in milliseconds. It doesn't care about exact wording. It cares about meaning.
 
-So when someone asks, "What's the blast radius if the auth service goes down?" what they actually need is: find the auth service, walk to every service that depends on it, walk to every project those services belong to, find the owners, find the on-call rotations. That's a graph traversal. Three or four hops. Vector search, no matter how good your embeddings are, cannot do this. You can throw GPT-5 at the output all day long and it will not magically reconstruct a dependency chain that was never in any single document.
+**Kind 2: "Find me exactly this."** Now the user wants a specific string. A case number. An error code. A product SKU. A legal citation like `410 U.S. 113`. Vector search is surprisingly bad at this, because embedding models round off rare tokens. The numbers and codes that matter most to your users are the tokens the model has the least signal on. Hybrid search is the answer here, combining vector similarity with old-school full-text matching. Postgres ships `tsvector` and `tsquery` for free, and BM25 is a solved problem. Use it. If you need to find docket number 17-204, you want a keyword hit, not a vibe.
 
-And look, I'm not here to trash vector search. I love pgvector. I use it constantly. I'm saying that we've collectively convinced ourselves that stuffing everything into an embedding is the answer, when for a whole class of questions, the honest answer is: you're using the wrong tool. It's like trying to find your car keys with a metal detector set to "gold." The tool is fine. The tool is not the problem.
+**Kind 3: "Show me how these things connect."** This is the one that breaks RAG systems in demos. The user wants structure. "Which justices tend to vote together on civil rights cases?" "What upstream services depend on the auth service?" "Who reports to the VP of Engineering?" The answer isn't hiding in a document somewhere. The answer lives in the edges between entities. You can't find it by similarity, and you can't find it by keyword, because it was never written down as text in the first place. You need a graph. Apache AGE lets you run Cypher inside Postgres and do multi-hop pattern matches without bolting on another database.
 
-## The fix preview
+So what does that actually mean for your architecture? It means every serious RAG system eventually needs all three retrieval paths. The only real question is whether you wire them up on purpose, now, or whether you wire them up at 2 AM after a demo goes sideways.
 
-What if your retrieval layer could search by meaning AND walk a knowledge graph in the same query, against the same database, with the same backup strategy and the same operational team? Turns out you can. Same Postgres, two extensions: pgvector for the embeddings, Apache AGE for the graph. No new database to run. No new pager rotation. No shiny vendor demo where the salesperson just happens to skip the part about HA.
+## Why most teams only build one
 
-## What is Apache AGE?
+Let's be honest about why this happens. Vector search is easy. There's a tutorial for it on every blog, including probably one I wrote. Hybrid search is a little harder, but it's well-documented and every Postgres shop already has `tsvector` in their back pocket whether they know it or not. Graph databases, though, feel foreign. They get dismissed with, "we don't need another database to babysit."
 
-Apache AGE is a PostgreSQL extension that adds graph database capabilities on top of regular Postgres. You create a graph, you define vertex labels and edge labels, and then you write Cypher queries (yes, the same Cypher that Neo4j uses) directly inside a SQL statement. Nodes and edges are first-class objects, not JSON blobs you're pretending are a graph. It supports multi-hop traversals, pattern matching, variable-length paths, all the stuff you'd expect from a real graph engine.
+I get it. I was that guy. For years I pushed back hard on adding more datastores to production stacks, because I've watched teams drown in their own infra choices. One Postgres cluster with backups and monitoring is a known problem. Three different datastores with three different failure modes is a new job.
 
-Nothing about it is magic. It's a well-designed extension that leans on the Postgres storage engine, transaction model, and backup tooling you already know. Which, if you've ever tried to run a standalone graph database in production next to your primary transactional store, is the whole point. The hard problem in AI Land is always data engineering, not database selection. AGE gives you graph power without forcing you to become a graph database administrator on top of everything else.
+Here's what I missed. You don't actually need another database. Apache AGE is a Postgres extension. pgvector is a Postgres extension. Full-text search is built in. You can run all three retrieval paths inside one Postgres 16 instance, with one backup job, one monitoring dashboard, and one on-call pager. I spent years telling people not to add more databases, and then I sat down to build this demo and realized the thing I was most worried about (running AGE and pgvector in the same cluster) was the easy part. The hard part, as always, was figuring out which retrieval technique to use when. Data engineering, not database selection. I guess I'm consistent if nothing else.
 
-## What is pgvector?
+## When each technique wins, and when it falls on its face
 
-You probably already know this one. pgvector is the Postgres extension for storing and searching vector embeddings, with HNSW indexes, cosine distance, inner product, the works. Standard tool at this point. If you're doing anything with LLMs and Postgres, you're already using it or you're about to.
+Abstract arguments are fine, but let me show you three real queries from the SCOTUS demo we built, because it makes the split obvious.
 
-## Setup: actual working code
-
-Here's the fun part. I'm not going to hand-wave this. The repo for this series is real, the code runs, and if it doesn't, please open an issue and roast me publicly.
-
-There's no reliable pre-built Postgres image that ships with both pgvector and Apache AGE, so we build from source. It's not as scary as it sounds. Here's the Dockerfile:
-
-```dockerfile
-FROM postgres:16
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    postgresql-server-dev-16 \
-    libreadline-dev \
-    zlib1g-dev \
-    flex \
-    bison \
-    && rm -rf /var/lib/apt/lists/*
-
-# Build and install pgvector 0.8.0
-RUN git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
-    && cd /tmp/pgvector \
-    && make OPTFLAGS="" \
-    && make install \
-    && rm -rf /tmp/pgvector
-
-# Build and install Apache AGE 1.5.0 for PG16
-RUN git clone --branch PG16/v1.5.0 --depth 1 https://github.com/apache/age.git /tmp/age \
-    && cd /tmp/age \
-    && make install \
-    && rm -rf /tmp/age
-
-# Preload AGE so LOAD is not needed per-session
-RUN echo "shared_preload_libraries = 'age'" >> /usr/share/postgresql/postgresql.conf.sample
-
-COPY initdb/ /docker-entrypoint-initdb.d/
-```
-
-Two things worth calling out. First, AGE needs to be in `shared_preload_libraries` so you don't have to `LOAD 'age'` at the start of every session. This was my first face-plant when I started with AGE. I spent an embarrassing amount of time wondering why my Cypher queries "randomly" stopped working between sessions. It's because I didn't read the docs. Classic Yonk move.
-
-Second, we pin specific versions: pgvector 0.8.0 and AGE 1.5.0 for Postgres 16. Pin your versions. Don't get cute with "latest." Future you will thank present you.
-
-The init scripts in `initdb/` run automatically the first time the container spins up a fresh data volume. The first one turns on both extensions:
+**Query 1: "Find cases about administrative overreach."** Vector search crushes this. The phrase "administrative overreach" probably isn't in the opinions verbatim, but the concepts ("arbitrary and capricious," "Chevron deference," "agency action") live in the same semantic neighborhood. A cosine similarity search over a pgvector index returns the right cases on the first try. Hybrid adds a little precision. Graph is basically useless here, because the answer isn't about which entities are connected, it's about what the documents mean. Vector-only is good enough, and you'd be wasting compute running the other paths.
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS age;
-ALTER DATABASE graphrag SET search_path = ag_catalog, "$user", public;
+SELECT case_name, 1 - (embedding <=> query_embedding) AS similarity
+FROM cases
+ORDER BY embedding <=> query_embedding
+LIMIT 10;
 ```
 
-That `search_path` line matters. AGE puts its functions in `ag_catalog`, and you want them visible without qualifying every call. Next, the relational schema for documents and their embeddings:
+**Query 2: "Find the case with docket number 17-204."** Now vector fails. `17-204` doesn't carry meaningful embedding signal, and the model compresses it into something close to the general idea of "numbers in a legal document." You'll get a bunch of cases that mention docket numbers, just not the one you asked for. Hybrid search saves you here, because `tsquery` matches the exact token and ranks it first. This is a one-line win, and it's the reason I still tell people to turn on full-text search even when they think they don't need it.
 
-```sql
-CREATE TABLE documents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    doc_type TEXT NOT NULL CHECK (doc_type IN (
-        'meeting_note', 'architecture_doc', 'incident_report', 'decision_record'
-    )),
-    author_id TEXT NOT NULL,
-    project_id TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    embedding vector(384)
-);
+**Query 3: "Which cases did Justice Thomas and Justice Sotomayor vote together on?"** This is the money query. Vector search returns documents that talk about voting. Hybrid search returns documents that mention both names. Neither actually answers the question, because the answer isn't in any single document. It lives in the edges between Justice nodes and Case nodes in the graph. One Cypher query does what vector and hybrid cannot do at any cost:
 
-CREATE INDEX idx_documents_embedding ON documents
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 200);
+```cypher
+MATCH (j1:Justice {name: 'Clarence Thomas'})-[:VOTED_MAJORITY]->(c:Case)
+      <-[:VOTED_MAJORITY]-(j2:Justice {name: 'Sonia Sotomayor'})
+RETURN c.case_name, c.decided
+ORDER BY c.decided DESC;
 ```
 
-384-dimensional vectors because we're using a small, local embedding model for the demo (right-sized AI, remember, you do not need OpenAI's biggest embedding model to search 160 documents). HNSW index for fast approximate nearest neighbor. Standard pgvector stuff.
+That's a multi-hop pattern match across typed edges. Vector and hybrid cannot express this query, period. Not slowly, not with clever prompting, not at all. If your users ever ask questions that require reasoning over relationships between entities, a graph isn't a nice-to-have. It's the only thing that works.
 
-Then the graph schema, which is where things get interesting:
+## How we built the demo
 
-```sql
-SELECT ag_catalog.create_graph('org_graph');
+The stack is deliberately boring, which is the point. Postgres 16 with pgvector and Apache AGE, both built from source and baked into one image. A FastAPI orchestrator that runs all four retrieval paths in parallel (vector only, hybrid, graph only, and a combined path that merges them with reranking). A side-by-side UI that shows exactly what each approach returns for the same question, so you can see the split with your own eyes instead of taking my word for it. One Postgres cluster. One ops footprint. No hand-waving.
 
-SELECT ag_catalog.create_vlabel('org_graph', 'Person');
-SELECT ag_catalog.create_vlabel('org_graph', 'Team');
-SELECT ag_catalog.create_vlabel('org_graph', 'Project');
-SELECT ag_catalog.create_vlabel('org_graph', 'Service');
-SELECT ag_catalog.create_vlabel('org_graph', 'Technology');
+The dataset is real. 391 Supreme Court cases from 2018 through 2023, with justice votes, majority opinions, dissents, and citations modeled as graph edges. We also ship a synthetic Acme Labs org knowledge base example for people who want to see the same pattern on corporate-style data without the legal vocabulary. Both run on the same stack, and both make the three-question split painfully obvious. The repo is public. Pull it, run it, and ask it the questions your users actually ask you.
 
-SELECT ag_catalog.create_elabel('org_graph', 'WORKS_ON');
-SELECT ag_catalog.create_elabel('org_graph', 'MEMBER_OF');
-SELECT ag_catalog.create_elabel('org_graph', 'DEPENDS_ON');
-SELECT ag_catalog.create_elabel('org_graph', 'OWNS');
-SELECT ag_catalog.create_elabel('org_graph', 'KNOWS_ABOUT');
-SELECT ag_catalog.create_elabel('org_graph', 'REPORTS_TO');
-SELECT ag_catalog.create_elabel('org_graph', 'AUTHORED');
-```
+The reason we run all four paths in parallel in the demo, instead of routing queries to one path, is that routing is itself a hard problem. Query classification is brittle. Users write ambiguous prompts that look semantic but need a graph, or look like graph questions but are really keyword lookups in disguise. Running them all and comparing results is the cheapest way I've found to learn what your users are actually asking and which path pays off for which query. Once you have that data, you can build a smarter router. Before you have it, any router you build is just a guess wearing a lab coat. And guessing about user intent is the fastest way I know to end up with a RAG system that looks great in the sales deck and falls over the first time somebody clicks around.
 
-Five vertex types, seven edge types. People, teams, projects, services, technologies. They work on things, they're members of things, they own things, they depend on things. This is the structure your documents are *about* but never actually *contain*.
+## What's coming in Parts 2 and 3
 
-The `docker-compose.yml` wires it together with a Python app that we'll actually use in Part 2:
+Part 2 is the setup guide. How to build Postgres 16 with AGE and pgvector from source (because the packaged builds don't always line up), how to bring up the Docker Compose stack, and how to run your first Cypher query and your first vector query to prove the thing is alive. It's the "I just want to get this running on my laptop before lunch" post.
 
-```yaml
-services:
-  postgres:
-    build:
-      context: ./postgres
-    environment:
-      POSTGRES_DB: graphrag
-      POSTGRES_USER: graphrag
-      POSTGRES_PASSWORD: graphrag
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U graphrag -d graphrag"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-```
+Part 3 is the replication walkthrough. How we built the SCOTUS parser, how we designed the graph schema (justices, cases, votes, citations, and the tradeoffs in each), how we added multi-hop query detection so the orchestrator knows when to reach for Cypher, and how to adapt the whole thing to your own dataset. If you want to build your own GraphRAG system on top of this pattern, Part 3 is the one to bookmark.
 
-Bring it up with `docker compose up --build`. First run takes a few minutes because we're compiling two extensions from source. Grab a coffee. After that, subsequent builds are cached and fast. You can verify the extensions are loaded with `\dx` in psql, and you can confirm the graph exists with `SELECT * FROM ag_catalog.ag_graph;`.
+## Your homework
 
-## Loading the data
+Your RAG pipeline probably answers two out of three kinds of questions today. Which one is it missing? Go find out. Run the demo, point it at the SCOTUS data, and ask it the stuff your actual users ask. If it falls apart on the relationship questions, you know what you're missing. If it fumbles the exact-match keyword questions, you know what you're missing. The worst answer is "I don't know which ones I'm missing," because that's the version where you find out in production with a Slack thread full of angry users.
 
-The seed script auto-runs on startup and populates a fictional organization called Acme Labs: 15 people, 8 projects, 5 services, 160 documents across meeting notes, architecture docs, incident reports, and decision records. All the relationships between people and teams and projects are wired up in the graph. I'll spare you the details here because the point of this post is the *why*, not the *what*, and Part 2 is where we actually start running queries against both stores together.
-
-## First demo: where vector search falls flat
-
-Fire up the demo app and ask it, vector-only, "Who should I talk to about the payment service?" You'll get back a ranked list of documents that mention payments. A meeting note where somebody complained about Stripe latency. An architecture doc that references the payment API in passing. An incident report from a Black Friday outage. None of them tell you who actually owns the service today.
-
-And that's because the answer isn't written down in any one document. The answer is a graph walk: find the Service node named "payment-service," follow the OWNS edge backward to the Team, follow MEMBER_OF to the People, maybe follow REPORTS_TO one hop up for a tech lead. Vector search can't do this, not because pgvector is bad, but because the information literally isn't in the text corpus in the form vector search needs. You cannot cosine-similarity your way to a relationship that was never serialized into prose.
-
-## What's next
-
-In Part 2, we add the graph layer for real and build three different retrieval strategies: pure vector, pure graph, and a hybrid that does both and combines the results. I'll show you the exact Cypher queries, the exact SQL, and the exact moments where one approach beats the other. I'll also show you at least one query where the hybrid is worse than either component alone, because that happens too, and if your blog series never shows you the failure cases, you're reading marketing, not engineering.
-
-Before you read Part 2, do me a favor. Go open your own RAG system and ask it three questions that require following a chain of relationships. Not "summarize this," not "find the doc about X." Real questions like, "If this service goes down, who gets paged, and what breaks?" Write down what you get back. Then ask yourself honestly: is this the answer, or is it just text that sounds like the answer? If you can tell the difference, you already get why we're building this. If you can't, you're about to find out.
-
-See you in Part 2.
+Me, I'll be over here running Cypher inside Postgres and pretending I always thought graphs were a good idea. Don't tell anyone I used to argue the other way.
