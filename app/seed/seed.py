@@ -181,13 +181,14 @@ def load_scotus_graph(cur, data: dict):
     print("Loading SCOTUS graph nodes...")
 
     for j in data["justices"]:
+        first_term = j.get("first_term") if j.get("first_term") is not None else 2018
+        last_term = j.get("last_term") if j.get("last_term") is not None else 2023
         _cypher(cur, (
             f"CREATE (n:Justice {{"
             f"id: '{_escape(j['id'])}', "
             f"name: '{_escape(j['name'])}', "
-            f"active_start: {j['active_start']}, "
-            f"active_end: {j['active_end']}, "
-            f"lean: '{_escape(j['lean'])}'"
+            f"first_term: {first_term}, "
+            f"last_term: {last_term}"
             f"}})"
         ))
 
@@ -201,15 +202,18 @@ def load_scotus_graph(cur, data: dict):
         ))
 
     for c in data["cases"]:
+        term_val = c["term"] if c["term"] is not None else 2020
         _cypher(cur, (
             f"CREATE (n:Case {{"
             f"id: '{_escape(c['id'])}', "
             f"name: '{_escape(c['name'])}', "
             f"docket: '{_escape(c['docket'])}', "
-            f"term: {c['term']}, "
-            f"year: {c['year']}, "
             f"citation: '{_escape(c['citation'])}', "
-            f"outcome: '{_escape(c['outcome'])}'"
+            f"term: {term_val}, "
+            f"petitioner: '{_escape(c['petitioner'])}', "
+            f"respondent: '{_escape(c['respondent'])}', "
+            f"vote_split: '{_escape(c['vote_split'])}', "
+            f"winning_party: '{_escape(c['winning_party'])}'"
             f"}})"
         ))
 
@@ -224,33 +228,36 @@ def load_scotus_graph(cur, data: dict):
                 f"CREATE (a)-[:CONCERNS]->(b)"
             ))
 
-    # Votes: VOTED_MAJORITY / VOTED_DISSENT
+    # Votes: VOTED_MAJORITY / VOTED_DISSENT / VOTED_CONCURRING
     for c in data["cases"]:
-        for jid, vote in c["votes"].items():
-            edge = "VOTED_MAJORITY" if vote == "majority" else "VOTED_DISSENT"
+        for vote in c["votes"]:
+            jid = vote["justice_id"]
+            side = vote["side"]
+            role = (vote.get("role") or "").lower()
+            edge = "VOTED_MAJORITY" if side == "majority" else "VOTED_DISSENT"
             _cypher(cur, (
                 f"MATCH (a:Justice {{id: '{_escape(jid)}'}}), "
                 f"(b:Case {{id: '{_escape(c['id'])}'}}) "
                 f"CREATE (a)-[:{edge}]->(b)"
             ))
-        # VOTED_CONCURRING for concurring justices (in addition to majority)
-        for jid in c.get("concurring_ids", []):
-            _cypher(cur, (
-                f"MATCH (a:Justice {{id: '{_escape(jid)}'}}), "
-                f"(b:Case {{id: '{_escape(c['id'])}'}}) "
-                f"CREATE (a)-[:VOTED_CONCURRING]->(b)"
-            ))
+            if "concurring" in role or "concurrence" in role:
+                _cypher(cur, (
+                    f"MATCH (a:Justice {{id: '{_escape(jid)}'}}), "
+                    f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+                    f"CREATE (a)-[:VOTED_CONCURRING]->(b)"
+                ))
 
-    # WROTE_OPINION (majority author and dissent author)
+    # WROTE_OPINION (majority author and dissent authors)
     for c in data["cases"]:
-        _cypher(cur, (
-            f"MATCH (a:Justice {{id: '{_escape(c['majority_author'])}'}}), "
-            f"(b:Case {{id: '{_escape(c['id'])}'}}) "
-            f"CREATE (a)-[:WROTE_OPINION {{type: 'majority'}}]->(b)"
-        ))
-        if c["dissent_author"]:
+        if c.get("majority_author_id"):
             _cypher(cur, (
-                f"MATCH (a:Justice {{id: '{_escape(c['dissent_author'])}'}}), "
+                f"MATCH (a:Justice {{id: '{_escape(c['majority_author_id'])}'}}), "
+                f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+                f"CREATE (a)-[:WROTE_OPINION {{type: 'majority'}}]->(b)"
+            ))
+        for did in c.get("dissent_author_ids", []):
+            _cypher(cur, (
+                f"MATCH (a:Justice {{id: '{_escape(did)}'}}), "
                 f"(b:Case {{id: '{_escape(c['id'])}'}}) "
                 f"CREATE (a)-[:WROTE_OPINION {{type: 'dissent'}}]->(b)"
             ))
