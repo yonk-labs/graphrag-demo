@@ -13,3 +13,15 @@ SELECT ag_catalog.create_elabel('org_graph', 'OWNS');
 SELECT ag_catalog.create_elabel('org_graph', 'KNOWS_ABOUT');
 SELECT ag_catalog.create_elabel('org_graph', 'REPORTS_TO');
 SELECT ag_catalog.create_elabel('org_graph', 'AUTHORED');
+
+-- SCOTUS dataset labels (second example, same graph)
+SELECT ag_catalog.create_vlabel('org_graph', 'Case');
+SELECT ag_catalog.create_vlabel('org_graph', 'Justice');
+SELECT ag_catalog.create_vlabel('org_graph', 'Issue');
+
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_MAJORITY');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_DISSENT');
+SELECT ag_catalog.create_elabel('org_graph', 'VOTED_CONCURRING');
+SELECT ag_catalog.create_elabel('org_graph', 'WROTE_OPINION');
+SELECT ag_catalog.create_elabel('org_graph', 'CITED');
+SELECT ag_catalog.create_elabel('org_graph', 'CONCERNS');

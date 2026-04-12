@@ -2,11 +2,10 @@ CREATE TABLE documents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title TEXT NOT NULL,
     content TEXT NOT NULL,
-    doc_type TEXT NOT NULL CHECK (doc_type IN (
-        'meeting_note', 'architecture_doc', 'incident_report', 'decision_record'
-    )),
+    doc_type TEXT NOT NULL,
     author_id TEXT NOT NULL,
     project_id TEXT,
+    dataset TEXT NOT NULL DEFAULT 'acme',
     created_at TIMESTAMP DEFAULT NOW(),
     embedding vector(384)
 );
@@ -18,3 +17,4 @@ CREATE INDEX idx_documents_embedding ON documents
 CREATE INDEX idx_documents_author ON documents (author_id);
 CREATE INDEX idx_documents_project ON documents (project_id);
 CREATE INDEX idx_documents_doc_type ON documents (doc_type);
+CREATE INDEX idx_documents_dataset ON documents (dataset);

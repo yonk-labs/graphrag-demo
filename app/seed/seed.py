@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
 from embeddings import get_embedding_provider
 from seed.generate_data import generate_all
+from seed.scotus_data import generate_all as generate_scotus_all
 
 
 def _cypher(cur, query: str):
@@ -160,18 +161,107 @@ def load_documents(cur, data: dict, embedding_provider):
     print(f"Loading {len(docs)} documents...")
     for doc, embedding in zip(docs, embeddings):
         cur.execute(
-            """INSERT INTO documents (id, title, content, doc_type, author_id, project_id, created_at, embedding)
-               VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s::vector)""",
+            """INSERT INTO documents (id, title, content, doc_type, author_id, project_id, dataset, created_at, embedding)
+               VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s::vector)""",
             (
                 doc["title"],
                 doc["content"],
                 doc["doc_type"],
                 doc["author_id"],
                 doc["project_id"],
+                doc.get("dataset", "acme"),
                 doc["created_at"],
                 str(embedding),
             ),
         )
+
+
+def load_scotus_graph(cur, data: dict):
+    """Load SCOTUS nodes and edges into the AGE graph."""
+    print("Loading SCOTUS graph nodes...")
+
+    for j in data["justices"]:
+        _cypher(cur, (
+            f"CREATE (n:Justice {{"
+            f"id: '{_escape(j['id'])}', "
+            f"name: '{_escape(j['name'])}', "
+            f"active_start: {j['active_start']}, "
+            f"active_end: {j['active_end']}, "
+            f"lean: '{_escape(j['lean'])}'"
+            f"}})"
+        ))
+
+    for iss in data["issues"]:
+        _cypher(cur, (
+            f"CREATE (n:Issue {{"
+            f"id: '{_escape(iss['id'])}', "
+            f"name: '{_escape(iss['name'])}', "
+            f"category: '{_escape(iss['category'])}'"
+            f"}})"
+        ))
+
+    for c in data["cases"]:
+        _cypher(cur, (
+            f"CREATE (n:Case {{"
+            f"id: '{_escape(c['id'])}', "
+            f"name: '{_escape(c['name'])}', "
+            f"docket: '{_escape(c['docket'])}', "
+            f"term: {c['term']}, "
+            f"year: {c['year']}, "
+            f"citation: '{_escape(c['citation'])}', "
+            f"outcome: '{_escape(c['outcome'])}'"
+            f"}})"
+        ))
+
+    print("Loading SCOTUS graph edges...")
+
+    # CONCERNS: Case -> Issue
+    for c in data["cases"]:
+        for iid in c["issue_ids"]:
+            _cypher(cur, (
+                f"MATCH (a:Case {{id: '{_escape(c['id'])}'}}), "
+                f"(b:Issue {{id: '{_escape(iid)}'}}) "
+                f"CREATE (a)-[:CONCERNS]->(b)"
+            ))
+
+    # Votes: VOTED_MAJORITY / VOTED_DISSENT
+    for c in data["cases"]:
+        for jid, vote in c["votes"].items():
+            edge = "VOTED_MAJORITY" if vote == "majority" else "VOTED_DISSENT"
+            _cypher(cur, (
+                f"MATCH (a:Justice {{id: '{_escape(jid)}'}}), "
+                f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+                f"CREATE (a)-[:{edge}]->(b)"
+            ))
+        # VOTED_CONCURRING for concurring justices (in addition to majority)
+        for jid in c.get("concurring_ids", []):
+            _cypher(cur, (
+                f"MATCH (a:Justice {{id: '{_escape(jid)}'}}), "
+                f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+                f"CREATE (a)-[:VOTED_CONCURRING]->(b)"
+            ))
+
+    # WROTE_OPINION (majority author and dissent author)
+    for c in data["cases"]:
+        _cypher(cur, (
+            f"MATCH (a:Justice {{id: '{_escape(c['majority_author'])}'}}), "
+            f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+            f"CREATE (a)-[:WROTE_OPINION {{type: 'majority'}}]->(b)"
+        ))
+        if c["dissent_author"]:
+            _cypher(cur, (
+                f"MATCH (a:Justice {{id: '{_escape(c['dissent_author'])}'}}), "
+                f"(b:Case {{id: '{_escape(c['id'])}'}}) "
+                f"CREATE (a)-[:WROTE_OPINION {{type: 'dissent'}}]->(b)"
+            ))
+
+    # CITED: Case -> Case
+    for cit in data["citations"]:
+        _cypher(cur, (
+            f"MATCH (a:Case {{id: '{_escape(cit['from_id'])}'}}), "
+            f"(b:Case {{id: '{_escape(cit['to_id'])}'}}) "
+            f"CREATE (a)-[:CITED]->(b)"
+        ))
 
 
 def check_already_seeded(cur) -> bool:
@@ -205,7 +295,19 @@ def main():
 
         embedding_provider = get_embedding_provider(settings.embedding_provider)
         load_documents(cur, data, embedding_provider)
-        print(f"Documents loaded: {len(data['documents'])} documents with embeddings")
+        print(f"Acme documents loaded: {len(data['documents'])} documents with embeddings")
+
+        print("Generating SCOTUS data...")
+        scotus_data = generate_scotus_all()
+        load_scotus_graph(cur, scotus_data)
+        print(
+            f"SCOTUS graph loaded: {len(scotus_data['cases'])} cases, "
+            f"{len(scotus_data['justices'])} justices, "
+            f"{len(scotus_data['issues'])} issues, "
+            f"{len(scotus_data['citations'])} citations"
+        )
+        load_documents(cur, scotus_data, embedding_provider)
+        print(f"SCOTUS documents loaded: {len(scotus_data['documents'])} documents with embeddings")
 
     conn.close()
     print("Seed complete!")

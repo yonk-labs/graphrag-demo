@@ -392,6 +392,7 @@ def generate_documents() -> list[dict]:
                     "doc_type": doc_type,
                     "author_id": author["id"],
                     "project_id": proj["id"],
+                    "dataset": "acme",
                     "created_at": _random_date(),
                 })
                 doc_id += 1
