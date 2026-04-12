@@ -40,6 +40,8 @@ The bridge between graph and vector is the important part, and it's simpler than
 
 ## The four retrieval strategies
 
+Before I walk through the four strategies, I owe you a big honest caveat. Our demo runs all four strategies in parallel because we want to show you what each one retrieves in isolation, side by side, on the same question. That is NOT how you'd build this in production. In production, you'd use a 3-stage approach: vector+BM25 always, a cheap graph boost that re-ranks the vector results using 1-hop neighbors, and an expensive graph-expand step that only runs when the query shape or the vector confidence tells you it's worth it. I'll walk through the right production architecture after I show you the demo version, in a section called "What production should actually look like." If you only read one section of this post, skim the strategies and then read that one.
+
 Four strategies, one demo. Each one is a separate Python class, each one gets called in parallel from the API, and each one returns a list of `RetrievedItem` objects that the UI renders side by side.
 
 **Vector-only** is the boring one. Embed the question, run cosine similarity via the pgvector HNSW index, return the top k. From `app/retrieval/vector.py`:
@@ -138,6 +140,90 @@ If none of those patterns hit, we fall back to single-entity traversal: walk one
 
 So what does that actually mean? It means intent detection in this demo is basically a partition of the matched entities by label, with a hardcoded dispatch table. That's it. There's no LLM parsing the question, no fancy NL-to-Cypher translator. It's substring matching plus a decision tree. A proper production system would use an LLM to generate the Cypher directly, which is a real pattern called text-to-Cypher. But for a demo, and honestly for a lot of real apps where the query vocabulary is predictable, this minimum-viable version gets you maybe 80% of the value at maybe 1% of the cost. Don't reach for an LLM when a dispatch table will do.
 
+## What production should actually look like
+
+Everything up to this point describes the demo. The demo is a teaching tool and I'm proud of it, but I'm not going to let you walk away thinking "parallel-merge four retrievers into one ranker" is the production pattern. It isn't. I ran the benchmark, and the benchmark told me otherwise, and I'd rather you get the honest version than the demo version.
+
+Here's the shape of the production architecture, the one you'd actually build if you were shipping this to paying users:
+
+```
+Query
+  │
+  ▼
+Stage 1: Vector + BM25     (ALWAYS, ~20-30ms)
+  │  Top-K chunks by semantic + keyword relevance.
+  │
+  ▼
+Stage 2: Graph Boost       (CHEAP, +~10ms)
+  │  For each entity mentioned in the top-K chunks,
+  │  look up 1-hop neighbors in the graph and re-rank.
+  │  Chunks that mention a neighbor entity get score * 1.2.
+  │
+  ▼
+Stage 3: Graph Expand      (EXPENSIVE, CONDITIONAL, +30-60ms)
+  │  Only runs when:
+  │    - user explicitly asks for expand mode, or
+  │    - top-K vector scores are all weak (below threshold), or
+  │    - query matches a graph-shaped pattern
+  │      ("who voted with", "what depends on", "who owns")
+  │
+  ▼
+Return
+```
+
+Three stages, and the interesting design decision is which stage runs on which query. Stage 1 runs on every query, always. Stage 2 runs on every query too, but it's cheap because it's just a 1-hop neighbor lookup for a handful of entities and a score re-weight. Stage 3 runs only when the query earns it.
+
+Why does this beat the parallel-merge approach I showed you in the demo? Three reasons.
+
+First, the fast path stays fast. On a question like "what cases deal with administrative overreach," Stage 3 never fires, and your query completes in roughly 30 milliseconds because vector+BM25 is carrying the whole load. You're not paying graph-expand latency on questions that don't benefit from graph expand.
+
+Second, graph becomes a signal instead of a competing retriever. In the parallel-merge approach, graph results get ranked against vector results and the merge function has to decide which to trust. That's where graph hurts you on the wrong question, because a weak graph hit can push a strong vector hit off the page. In the 3-stage approach, graph never replaces a vector result. It just boosts vector results that are already in the running. The ranker never gets confused.
+
+Third, Stage 3 gets the full Cypher treatment when it does run. No fuzzing the output into a ranked list and hoping RRF sorts it out. A multi-hop query that's earned Stage 3 runs proper Cypher, returns a structural answer, and that answer goes to the top of the result list because it's the answer, not because it tied with a hybrid search.
+
+The benchmark numbers I kept staring at: vector+BM25 alone hits 75% to 90% accuracy on the majority of our test questions. Graph, applied correctly as a boost, adds another 1% to 5% on the questions that need multi-hop reasoning. And graph, applied incorrectly as a parallel retriever on questions that don't need it, SUBTRACTS 2% to 4%, because the dilution effect is real. The 3-stage arrangement is how you get the +1 to +5 benefit without paying the -2 to -4 cost.
+
+Here's what Stage 2 looks like in pseudocode, just to make the shape concrete:
+
+```python
+def stage2_graph_boost(top_k_chunks, cur):
+    # Collect entity ids mentioned in the top-K chunks
+    entity_ids = set()
+    for chunk in top_k_chunks:
+        entity_ids.update(chunk.entity_ids)
+
+    # One-hop neighbor lookup in AGE, cheap
+    neighbors = cypher_one_hop(cur, entity_ids)
+    # neighbors: set of entity ids within 1 hop of any top-K entity
+
+    # Re-rank: bump chunks that mention a neighbor
+    for chunk in top_k_chunks:
+        if chunk.entity_ids & neighbors:
+            chunk.score *= 1.2
+
+    return sorted(top_k_chunks, key=lambda c: -c.score)
+```
+
+And Stage 3, the conditional expand:
+
+```python
+def should_run_stage3(query, top_k_chunks):
+    if query.mode == "expand":
+        return True
+    if max(c.score for c in top_k_chunks) < WEAK_THRESHOLD:
+        return True
+    if matches_graph_pattern(query.text):
+        # "who voted with", "what depends on", "who owns", ...
+        return True
+    return False
+
+def stage3_graph_expand(query, cur):
+    # Real multi-hop Cypher, same as GraphRetrieval in the demo
+    return run_multihop_cypher(query, cur)
+```
+
+That's the production path. The demo doesn't run this because the demo is showing you what each retriever returns in isolation. Our "combined" strategy is intentionally more aggressive than a production pipeline should be. It's showing off capability, not optimizing for precision. If you copy the combined strategy verbatim into your product, you're going to see that -2 to -4% dilution effect on a chunk of your user questions, and you're going to wonder why your benchmark numbers got worse after you added graph. They got worse because you added graph to the ranker instead of adding graph to the re-rank step. Don't do that. Do 3-stage.
+
 ## The side-by-side demo UI
 
 The UI is deliberately boring. A FastAPI static page at `http://localhost:8000` with a search bar, a row of pre-loaded example queries, and four columns labeled Vector, Hybrid, Graph, and Graph+Vector+Hybrid. Hit an example or type your own, and all four columns fill in simultaneously with the retrieved results, the LLM-generated answer, and a little stacked bar chart showing where each strategy spent its time (embedding, vector search, graph traversal, reranking, LLM generation).
@@ -187,6 +273,8 @@ Real numbers from verified runs on my laptop:
 - **Graph** runs in 5 to 15 milliseconds for multi-hop Cypher patterns because AGE compiles them to native Postgres operators against indexed vertex and edge tables. Entity extraction on the question adds 1 to 3 milliseconds. The total graph path is often faster than vector because it doesn't have to embed anything.
 - **Combined** is roughly the max of the four component paths plus a small reranking step, so 40 to 80 milliseconds after warmup. It runs the four strategies in a thread pool, so the costs overlap rather than stack.
 
+One note on the parallel-merge cost in the demo. Running all four retrievers in parallel still costs you the max latency of the four plus the reranking step, because your response can't go out until the slowest retriever finishes. In the 3-stage production architecture from earlier, most queries never fire Stage 3 at all, which means most queries complete in roughly 30 milliseconds total. The only queries that eat the extra 30 to 60 milliseconds are the ones where the query shape actually needs a graph, and on those queries you were going to pay the cost anyway. Parallel-merge pays the graph cost on every query. 3-stage pays it only when it matters.
+
 The pattern I keep hammering: graph queries are fast when your graph is modeled right, because most graph questions only touch a handful of nodes. The slow part isn't the database, it's the embedding model. Cache it, warm it, batch the seed inserts.
 
 ## Adapting this to your own dataset
@@ -207,11 +295,12 @@ The hardest step is step one, and I can't do it for you from a blog post. Take t
 
 Things I'd do if this were a production system instead of a demo:
 
-1. **Text-to-Cypher with an LLM.** Substring matching plus a dispatch table is fine for a small number of query shapes. For a real product where users can ask anything, let an LLM generate the Cypher from the question. It's the right tool for the job.
-2. **Cross-encoder reranking.** RRF is decent. A cross-encoder model that scores (query, document) pairs on the top 20 to 50 results is measurably better. Add it after the combined merge and before the final top k.
-3. **Cache entity lookups.** We reload the full known-entities dict from the graph on every query. It's small so it doesn't matter, but in a graph with millions of entities you'd precompute a name-to-id index or use a bloom filter.
-4. **Embedding model as a dedicated service.** Running sentence-transformers inside the API container is fine for a demo. For production, move it out, batch requests, and run it on hardware that actually wants to do matmul.
-5. **Real distributed tracing.** We have stage timings per query, which is cute, but debugging a production RAG pipeline needs OpenTelemetry spans across the whole request. Do that from day one. You'll thank yourself.
+1. **Adopt the 3-stage retrieval architecture.** This is the number-one change and it's not close. Our demo's combined strategy runs vector, hybrid, graph, and graph-expand in parallel and merges them through a weighted ranker. That's a teaching pattern, not a production pattern. Production is Stage 1 vector+BM25 always on, Stage 2 cheap graph boost via 1-hop neighbor re-ranking, Stage 3 expensive graph expand only when the query shape or vector confidence says it's worth it. The combined path in this demo is intentionally aggressive because it's showing capability. Don't ship it as-is.
+2. **Text-to-Cypher with an LLM.** Substring matching plus a dispatch table is fine for a small number of query shapes. For a real product where users can ask anything, let an LLM generate the Cypher from the question. It's the right tool for the job, and it plugs naturally into Stage 3 of the architecture above.
+3. **Cross-encoder reranking.** RRF is decent. A cross-encoder model that scores (query, document) pairs on the top 20 to 50 results is measurably better. Add it after Stage 2 and before the final top k.
+4. **Cache entity lookups.** We reload the full known-entities dict from the graph on every query. It's small so it doesn't matter, but in a graph with millions of entities you'd precompute a name-to-id index or use a bloom filter.
+5. **Embedding model as a dedicated service.** Running sentence-transformers inside the API container is fine for a demo. For production, move it out, batch requests, and run it on hardware that actually wants to do matmul.
+6. **Real distributed tracing.** We have stage timings per query, which is cute, but debugging a production RAG pipeline needs OpenTelemetry spans across the whole request. Do that from day one. You'll thank yourself.
 
 None of this is exotic. The demo skips it because the demo is about showing the retrieval strategies, not shipping a product. Don't confuse the two.
 
@@ -220,5 +309,7 @@ None of this is exotic. The demo skips it because the demo is about showing the 
 Clone the repo. Run `docker compose up`. Ask your own questions. If every strategy returns the same top five results, your questions are too easy or your data is too correlated. Find a question where the strategies disagree. That's the one that matters. That's the question where your users get bad answers today and where a graph is going to rescue you tomorrow.
 
 Where I'd start: pull a week of query logs from whatever app you're building. Find the questions that start with "who," "which," or "what depends on." Run those through the demo with your data loaded. I'll bet you a coffee that at least a fifth of them return completely different top results from graph versus vector. Those are the ones you're answering badly right now, and they're fixable with 200 lines of Cypher and a weekend of schema design.
+
+And once you've broken the demo version, build the 3-stage version on your own dataset. Vector+BM25 always on, cheap graph boost in the middle, expensive graph expand only when the query earns it. That's the shape you'll actually ship. If you do it and the numbers move, I want to hear about it.
 
 Now stop reading and go break it. If you find something weird, or something better than what I built, tell me about it. The HOSS wants to see it.
