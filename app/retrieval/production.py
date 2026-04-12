@@ -19,6 +19,36 @@ from retrieval.graph import GraphRetrieval, _load_known_entities, extract_entiti
 # Threshold below which vector confidence is considered weak
 WEAK_CONFIDENCE_THRESHOLD = 0.5
 
+# Module-level cache: (category, entity_id) -> set of neighbor names (lowercased).
+# The graph is static at runtime, so we populate this once per label on demand.
+_neighbor_cache_by_label: dict[str, dict[str, set[str]]] = {}
+
+
+def _warm_neighbor_cache_for_label(cur, label: str, category: str) -> dict[str, set[str]]:
+    """Run one Cypher query returning every (source_id, neighbor_name) for a label.
+    Cached in-process; the graph is read-only at runtime."""
+    if label in _neighbor_cache_by_label:
+        return _neighbor_cache_by_label[label]
+
+    result: dict[str, set[str]] = {}
+    try:
+        cur.execute(
+            f"SELECT * FROM cypher('org_graph', $$ "
+            f"MATCH (n:{label})-[]-(m) "
+            f"RETURN n.id, m.name "
+            f"$$) AS (source_id agtype, neighbor_name agtype);"
+        )
+        for row in cur.fetchall():
+            source_id = str(row[0]).strip('"')
+            neighbor_name = str(row[1]).strip('"').lower()
+            if neighbor_name and neighbor_name != "null":
+                result.setdefault(source_id, set()).add(neighbor_name)
+    except Exception:
+        pass
+
+    _neighbor_cache_by_label[label] = result
+    return result
+
 # Patterns that suggest graph-shaped questions
 GRAPH_SHAPED_PATTERNS = [
     r"\bwho (owns|wrote|voted|dissented|cited|reports|manages|approved|authored)\b",
@@ -55,21 +85,6 @@ def _stage2_graph_boost(
     if not results:
         return results
 
-    result_entities: list[set[tuple[str, str]]] = []
-    for item in results:
-        text = f"{item.title} {item.content}".lower()
-        matched = set()
-        for category, name_map in known_entities.items():
-            for name, entity_id in name_map.items():
-                if name and name in text:
-                    matched.add((category, entity_id))
-        result_entities.append(matched)
-
-    unique_entities: set[tuple[str, str]] = set()
-    for entities in result_entities:
-        unique_entities.update(entities)
-
-    neighbor_cache: dict[tuple[str, str], set[str]] = {}
     label_map = {
         "people": "Person",
         "projects": "Project",
@@ -80,30 +95,70 @@ def _stage2_graph_boost(
         "justices": "Justice",
         "issues": "Issue",
     }
+    label_to_category = {v: k for k, v in label_map.items()}
 
-    for category, entity_id in unique_entities:
+    # First pass: count mentions across all results (on truncated content) so we
+    # can cap the set of candidate entities we actually bother with.
+    MAX_CONTENT_SCAN = 500
+    MAX_TOTAL_ENTITIES = 30
+
+    truncated_texts: list[str] = []
+    for item in results:
+        snippet = (item.content or "")[:MAX_CONTENT_SCAN]
+        truncated_texts.append(f"{item.title} {snippet}".lower())
+
+    mention_counts: dict[tuple[str, str], int] = {}
+    for text in truncated_texts:
+        for category, name_map in known_entities.items():
+            if category not in label_map:
+                continue
+            for name, entity_id in name_map.items():
+                if name and name in text:
+                    key = (category, entity_id)
+                    mention_counts[key] = mention_counts.get(key, 0) + 1
+
+    if not mention_counts:
+        return list(results)
+
+    top_entities = sorted(
+        mention_counts.items(), key=lambda kv: kv[1], reverse=True
+    )[:MAX_TOTAL_ENTITIES]
+    allowed_entities: set[tuple[str, str]] = {k for k, _ in top_entities}
+
+    # Build per-result entity sets, restricted to the capped candidate set.
+    result_entities: list[set[tuple[str, str]]] = []
+    for text in truncated_texts:
+        matched: set[tuple[str, str]] = set()
+        for (category, entity_id) in allowed_entities:
+            name_map = known_entities.get(category, {})
+            for name, eid in name_map.items():
+                if eid == entity_id and name and name in text:
+                    matched.add((category, entity_id))
+                    break
+        result_entities.append(matched)
+
+    # Neighbor lookup via module-level cache. We warm the cache once per label
+    # (one full-label Cypher scan), then all subsequent requests are in-memory.
+    neighbor_cache: dict[tuple[str, str], set[str]] = {}
+    labels_needed: set[str] = set()
+    for (category, _entity_id) in allowed_entities:
         label = label_map.get(category, "")
-        if not label:
-            continue
-        try:
-            cur.execute(
-                f"SELECT * FROM cypher('org_graph', $$ "
-                f"MATCH (n:{label} {{id: '{entity_id}'}})-[]-(m) "
-                f"RETURN m.name "
-                f"$$) AS (name agtype);"
-            )
-            neighbors = set()
-            for row in cur.fetchall():
-                name = str(row[0]).strip('"').lower()
-                if name and name != "null":
-                    neighbors.add(name)
-            neighbor_cache[(category, entity_id)] = neighbors
-        except Exception:
-            neighbor_cache[(category, entity_id)] = set()
+        if label:
+            labels_needed.add(label)
+
+    for label in labels_needed:
+        category = label_to_category[label]
+        label_cache = _warm_neighbor_cache_for_label(cur, label, category)
+        for (cat, entity_id) in allowed_entities:
+            if cat != category:
+                continue
+            neighbors = label_cache.get(entity_id)
+            if neighbors:
+                neighbor_cache[(cat, entity_id)] = neighbors
 
     boosted = []
     for i, item in enumerate(results):
-        text = f"{item.title} {item.content}".lower()
+        text = truncated_texts[i]
         boost_applied = False
         for j, other_entities in enumerate(result_entities):
             if i == j:

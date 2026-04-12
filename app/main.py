@@ -98,6 +98,24 @@ async def lifespan(app: FastAPI):
         hybrid_retrieval=HybridRetrieval(_embedding_provider),
         graph_retrieval=GraphRetrieval(),
     )
+
+    # Pre-warm the Stage 2 neighbor cache so the first real query isn't stuck
+    # behind a full graph scan. Failures are non-fatal (first query will warm).
+    try:
+        from retrieval.production import _warm_neighbor_cache_for_label
+        from db import get_connection as _get_conn
+        _label_pairs = [
+            ("Person", "people"), ("Project", "projects"), ("Service", "services"),
+            ("Team", "teams"), ("Technology", "technologies"),
+            ("Case", "cases"), ("Justice", "justices"), ("Issue", "issues"),
+        ]
+        with _get_conn() as _conn:
+            with _conn.cursor() as _cur:
+                for _label, _cat in _label_pairs:
+                    _warm_neighbor_cache_for_label(_cur, _label, _cat)
+    except Exception as _e:
+        print(f"Stage 2 cache warm skipped: {_e}")
+
     yield
     close_pool()
 

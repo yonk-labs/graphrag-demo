@@ -186,10 +186,11 @@ Two services. Postgres is the one we care about today. It builds from the Docker
 
 The `app` service is the FastAPI app we'll cover in Part 3. Ignore it for now. The healthcheck block on postgres means Compose will wait until Postgres is actually accepting connections before marking it healthy, which matters for the app service.
 
-Commands to bring it up and get a psql prompt:
+Commands to bring it up and get a psql prompt. Once we publish the official repo this URL will update; for now, fork the code from wherever you got it and adjust the clone command to match:
 
 ```bash
-git clone https://github.com/your-org/graphrag-demo.git
+# Clone the demo repo (replace with your fork or our published URL once available)
+git clone https://github.com/YOUR_GITHUB_USERNAME/graphrag-demo.git
 cd graphrag-demo
 docker compose up -d postgres
 # Give it a few seconds to start and run the init scripts
@@ -225,24 +226,41 @@ You'll see one row for `org_graph` with its namespace info. If either of these c
 
 ## Your first vector query
 
-Let's put some rows into the documents table and run a similarity search. We'll use fake embeddings so you don't need a model running yet. They won't return meaningful semantic matches, but they'll prove the plumbing works:
+Let's put some rows into the documents table and run a similarity search. We'll hand-write toy vectors so you don't need a model running yet. These are not realistic embeddings. They're crafted to make the cosine math easy to eyeball so you can verify the plumbing works end to end:
 
 ```sql
+-- Insert three test docs with distinct vectors.
+-- Each vector is mostly zeros, with a signature value at a known position so
+-- cosine similarity is easy to reason about.
 INSERT INTO documents (title, content, doc_type, author_id, embedding)
 VALUES
-  ('Test A', 'quick brown fox',        'meeting_note', 'p-alice', array_fill(0.1::real, ARRAY[384])::vector),
-  ('Test B', 'lazy dog sleeps',        'meeting_note', 'p-bob',   array_fill(0.2::real, ARRAY[384])::vector),
-  ('Test C', 'Sphinx of black quartz', 'meeting_note', 'p-carol', array_fill(0.3::real, ARRAY[384])::vector);
+  ('Vector Test A', 'apple pie recipe', 'meeting_note', 'tutorial',
+   ('[' || array_to_string(array_fill(0.0::real, ARRAY[383]), ',') || ',1.0]')::vector),
+  ('Vector Test B', 'grocery shopping list', 'meeting_note', 'tutorial',
+   ('[0.5,' || array_to_string(array_fill(0.0::real, ARRAY[382]), ',') || ',0.5]')::vector),
+  ('Vector Test C', 'quarterly earnings report', 'meeting_note', 'tutorial',
+   ('[' || array_to_string(array_fill(0.0::real, ARRAY[383]), ',') || ',-1.0]')::vector);
 
-SELECT title, 1 - (embedding <=> array_fill(0.15::real, ARRAY[384])::vector) AS similarity
+-- Query vector: same direction as Test A (zeros then +0.9 at the last slot).
+SELECT title,
+       1 - (embedding <=> ('[' || array_to_string(array_fill(0.0::real, ARRAY[383]), ',') || ',0.9]')::vector) AS similarity
 FROM documents
-ORDER BY embedding <=> array_fill(0.15::real, ARRAY[384])::vector
+WHERE author_id = 'tutorial'
+ORDER BY embedding <=> ('[' || array_to_string(array_fill(0.0::real, ARRAY[383]), ',') || ',0.9]')::vector
 LIMIT 3;
 ```
 
-The `<=>` operator is pgvector's cosine distance. Lower means closer. Since a lot of people think in terms of similarity (higher is better), the convention is `1 - distance` to flip it into a 0-to-1 similarity score. The query above returns the three rows ordered by closeness to our query vector of all 0.15s, and Test A (all 0.1s) should come out closest.
+The `<=>` operator is pgvector's cosine distance. Lower means closer. Since a lot of people think in terms of similarity (higher is better), the convention is `1 - distance` to flip it into a 0-to-1 similarity score. The `WHERE author_id = 'tutorial'` keeps the query focused on the three toy rows rather than any seed data that might already live in the table.
 
-Real embeddings come from a model. Sentence-transformers running locally, OpenAI's text-embedding-3 line, Cohere, whatever you like. They all produce a float vector of fixed dimension that you stick in that `vector(384)` column. In Part 3 we'll swap in a real local model so the similarity scores actually mean something.
+You should see Test A first with similarity `1.0`, Test B second at roughly `0.707`, and Test C last at `-1.0`. Walk through why: Test A points in exactly the same direction as the query vector (both are zero everywhere except a positive value in the last slot), so cosine similarity is 1. Test B has half its weight in the last slot and half at the start, which lines up partially with the query, giving `1/sqrt(2)`. Test C points in the exact opposite direction at the last slot, so cosine similarity is -1. That's the whole idea of cosine similarity in three rows.
+
+Clean up when you're done so these toy rows don't pollute later queries:
+
+```sql
+DELETE FROM documents WHERE author_id = 'tutorial';
+```
+
+Real embeddings come from a model. Sentence-transformers running locally, OpenAI's text-embedding-3 line, Cohere, whatever you like. They all produce a float vector of fixed dimension that you stick in that `vector(384)` column. You never hand-write vectors in production. The toy example above exists only to confirm the SQL plumbing is wired correctly. It is not what a real RAG pipeline looks like. In Part 3 we'll swap in a real local model so the similarity scores actually mean something.
 
 ## Your first Cypher query
 
