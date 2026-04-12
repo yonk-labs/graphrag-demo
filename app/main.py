@@ -15,6 +15,7 @@ from llm import get_llm_provider
 from retrieval.vector import VectorRetrieval
 from retrieval.graph import GraphRetrieval
 from retrieval.combined import CombinedRetrieval
+from seed.seed import main as run_seed
 
 _executor = ThreadPoolExecutor(max_workers=6)
 _embedding_provider = None
@@ -50,6 +51,13 @@ async def lifespan(app: FastAPI):
     global _vector_retrieval, _graph_retrieval, _combined_retrieval
 
     init_pool()
+
+    # Auto-seed on first run (no-op if already seeded)
+    try:
+        run_seed()
+    except Exception as e:
+        print(f"Seed skipped or failed: {e}")
+
     _embedding_provider = get_embedding_provider(settings.embedding_provider)
     _llm_provider = get_llm_provider(settings.llm_provider)
     _vector_retrieval = VectorRetrieval(_embedding_provider)
